@@ -1,0 +1,36 @@
+# Environment
+.env
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ROCm profiling output
+results/
+workloads/
+*.db
+*.json.gz
+rocprof_*.csv
+omniperf_*/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+
+# Don't commit reference baseline files (fetch from gpu-mode/reference-kernels)
+*/reference.py
+*/task.py
+*/task.yml
+
+# Model weights / large files
+*.pt
+*.safetensors
+*.gguf
+*.bin
