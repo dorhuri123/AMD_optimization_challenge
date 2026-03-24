@@ -1,126 +1,189 @@
 """
-mixed-mla — custom_kernel submission
-=====================================
-DeepSeek R1 forward_absorb MLA decode, optimized for AMD MI355X.
+Optimized MLA decode submission.
 
-Interface (from task.py):
-  data = (q, kv_data, qo_indptr, kv_indptr, config)
-    q          : (total_q, 16, 576)    bfloat16   — absorbed query (kv_lora_rank + qk_rope_dim)
-    kv_data    : dict with keys:
-                   "bf16"  -> Tensor (total_kv, 1, 576)           bfloat16
-                   "fp8"   -> (kv_fp8, scale)  fp8 + scalar float
-                   "mxfp4" -> (kv_fp4x2, scale_e8m0)
-    qo_indptr  : (batch+1,)  int32
-    kv_indptr  : (batch+1,)  int32
-    config     : dict with MLA parameters
-  Output: (total_q, 16, 512)  bfloat16
+Optimization v1 — two low-hanging fruit over the reference:
+  1. Adaptive num_kv_splits per (batch_size, kv_seq_len) config
+     Reference hardcodes 32; optimal value depends on total KV tokens vs CU count.
+  2. Adaptive Q dtype: skip fp8 Q quantization for small batches (a16w8 path)
+     where the quantization kernel launch overhead exceeds the BW savings.
 
-Architecture (DeepSeek R1):
-  num_heads     = 16
-  num_kv_heads  = 1
-  kv_lora_rank  = 512   (value dim, first 512 of kv_buffer)
-  qk_rope_dim   = 64
-  qk_head_dim   = 576   (kv_lora_rank + qk_rope_dim)
-  sm_scale      = 1 / sqrt(576)
-
-Reference performance (AITER a8w8 on MI355X):
-  fp8 Q + fp8 KV: 1.4–2.3x over bf16
-
-Optimization target:
-  Use MXFP4 KV cache (4x bandwidth savings vs bf16) and/or fuse
-  dequant into the attention kernel to exceed the a8w8 reference.
+Both use the same AITER persistent kernel — no custom Triton needed yet.
 """
 
 import torch
-import aiter
 from task import input_t, output_t
 
-# ── Architecture constants ────────────────────────────────────────────
-NUM_HEADS    = 16
+from aiter.mla import mla_decode_fwd
+from aiter import dtypes as aiter_dtypes
+from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
+
+# ---------------------------------------------------------------------------
+# Constants (same as reference)
+# ---------------------------------------------------------------------------
+NUM_HEADS = 16
 NUM_KV_HEADS = 1
 KV_LORA_RANK = 512
-QK_ROPE_DIM  = 64
-QK_HEAD_DIM  = KV_LORA_RANK + QK_ROPE_DIM  # 576
-SM_SCALE     = 1.0 / (QK_HEAD_DIM ** 0.5)
+QK_ROPE_HEAD_DIM = 64
+QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM   # 576
+V_HEAD_DIM = KV_LORA_RANK                        # 512
+SM_SCALE = 1.0 / (QK_HEAD_DIM ** 0.5)
+PAGE_SIZE = 1
+FP8_DTYPE = aiter_dtypes.fp8
 
-# ROCm FP8 format (e4m3fnuz, max = 240, not NVIDIA's e4m3fn max = 448)
-FP8_DTYPE = torch.float8_e4m3fnuz
-FP8_MAX   = torch.finfo(FP8_DTYPE).max
+# ---------------------------------------------------------------------------
+# Tuning parameters — FILL IN after running sweep_kv_splits.py on MI355X
+# ---------------------------------------------------------------------------
+# Map (batch_size, kv_seq_len) -> optimal num_kv_splits
+# Default to 32 (same as reference) until we have profiling data.
+KV_SPLITS_MAP = {
+    # (bs, kvlen): splits
+    (4, 1024): 32,
+    (4, 8192): 32,
+    (32, 1024): 32,
+    (32, 8192): 32,
+    (64, 1024): 32,
+    (64, 8192): 32,
+    (256, 1024): 32,
+    (256, 8192): 32,
+}
+DEFAULT_KV_SPLITS = 32
+
+# Batch size threshold: use bf16 Q (a16w8) below this, fp8 Q (a8w8) above.
+# Set to 0 to always use fp8 Q (same as reference).
+# TODO: tune on MI355X — try 16 or 32
+Q_FP8_BS_THRESHOLD = 0
 
 
-def _quant_fp8_dynamic(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dynamic per-tensor FP8 quantization (sglang style)."""
-    scale = x.abs().max() / FP8_MAX
-    return (x / scale).to(FP8_DTYPE), scale
+# ---------------------------------------------------------------------------
+# FP8 quantization (same as reference)
+# ---------------------------------------------------------------------------
+def quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    finfo = torch.finfo(FP8_DTYPE)
+    amax = tensor.abs().amax().clamp(min=1e-12)
+    scale = amax / finfo.max
+    fp8_tensor = (tensor / scale).clamp(min=finfo.min, max=finfo.max).to(FP8_DTYPE)
+    return fp8_tensor, scale.to(torch.float32).reshape(1)
 
 
-def custom_kernel(data: input_t) -> output_t:
-    """
-    Optimized MLA decode kernel.
-
-    Current strategy: fp8 Q + fp8 KV via AITER persistent decode kernel
-    (mirrors the reference a8w8 path).
-
-    TODO optimizations to beat the reference:
-      1. Use MXFP4 KV cache instead of FP8 — 4x bandwidth vs bf16, 2x vs fp8
-         → uncomment USE_MXFP4 block below once AITER mxfp4 MLA path is verified
-      2. Tune num_kv_splits for MI355X (currently auto-determined by AITER)
-      3. Write a custom Triton kernel that fuses dequant + attention + output
-         → key insight from vLLM PR #36297: fusing BMM + FP8 quant on the
-           output side yields 5.2–6.6x on MI300X; apply same idea here for
-           the kv-side dequantization
-    """
-    q, kv_data, qo_indptr, kv_indptr, config = data
-
-    total_q  = q.shape[0]
-    output   = torch.empty(
-        (total_q, NUM_HEADS, KV_LORA_RANK), device=q.device, dtype=torch.bfloat16
+# ---------------------------------------------------------------------------
+# Persistent mode metadata (parameterized on num_kv_splits)
+# ---------------------------------------------------------------------------
+def _make_mla_decode_metadata(
+    batch_size, max_q_len, nhead, nhead_kv,
+    q_dtype, kv_dtype,
+    qo_indptr, kv_indptr, kv_last_page_len,
+    num_kv_splits,
+):
+    info = get_mla_metadata_info_v1(
+        batch_size, max_q_len, nhead, q_dtype, kv_dtype,
+        is_sparse=False, fast_mode=False,
+        num_kv_splits=num_kv_splits, intra_batch_mode=True,
     )
-    kv_last_page_lens = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
-    kv_indices = torch.arange(kv_indptr[-1].item(), device=q.device, dtype=torch.int32)
+    work = [torch.empty(s, dtype=t, device="cuda") for s, t in info]
+    (work_metadata, work_indptr, work_info_set,
+     reduce_indptr, reduce_final_map, reduce_partial_map) = work
 
-    # ── Path A: MXFP4 KV (4x BW savings) ────────────────────────────
-    # TODO: enable once AITER MXFP4 MLA decode API is confirmed
-    # if "mxfp4" in kv_data:
-    #     kv_buffer, kv_scale = kv_data["mxfp4"]
-    #     q_fp8, q_scale = _quant_fp8_dynamic(q)
-    #     aiter.mla_decode_fwd(
-    #         q_fp8, kv_buffer, output, qo_indptr, kv_indptr,
-    #         kv_indices, kv_last_page_lens, max_seqlen_q=1,
-    #         sm_scale=SM_SCALE, kv_scale=kv_scale, q_scale=q_scale,
-    #     )
-    #     return output
+    get_mla_metadata_v1(
+        qo_indptr, kv_indptr, kv_last_page_len,
+        nhead // nhead_kv, nhead_kv, True,
+        work_metadata, work_info_set, work_indptr,
+        reduce_indptr, reduce_final_map, reduce_partial_map,
+        page_size=PAGE_SIZE,
+        kv_granularity=max(PAGE_SIZE, 16),
+        max_seqlen_qo=max_q_len,
+        uni_seqlen_qo=max_q_len,
+        fast_mode=False,
+        max_split_per_batch=num_kv_splits,
+        intra_batch_mode=True,
+        dtype_q=q_dtype,
+        dtype_kv=kv_dtype,
+    )
 
-    # ── Path B: FP8 Q + FP8 KV (a8w8, matches reference) ────────────
-    if "fp8" in kv_data:
-        kv_buffer, kv_scale = kv_data["fp8"]
-        q_fp8, q_scale = _quant_fp8_dynamic(q)
-        aiter.mla_decode_fwd(
-            q=q_fp8,
-            kv_buffer=kv_buffer,
-            o=output,
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            kv_last_page_lens=kv_last_page_lens,
-            max_seqlen_q=1,
-            sm_scale=SM_SCALE,
-            kv_scale=kv_scale,
-            q_scale=q_scale,
-        )
-        return output
+    return {
+        "work_meta_data": work_metadata,
+        "work_indptr": work_indptr,
+        "work_info_set": work_info_set,
+        "reduce_indptr": reduce_indptr,
+        "reduce_final_map": reduce_final_map,
+        "reduce_partial_map": reduce_partial_map,
+    }
 
-    # ── Path C: BF16 fallback ────────────────────────────────────────
-    kv_buffer = kv_data["bf16"]
-    aiter.mla_decode_fwd(
-        q=q,
-        kv_buffer=kv_buffer,
-        o=output,
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_indices=kv_indices,
-        kv_last_page_lens=kv_last_page_lens,
-        max_seqlen_q=1,
+
+# ---------------------------------------------------------------------------
+# Core MLA decode with configurable splits
+# ---------------------------------------------------------------------------
+def _mla_decode(
+    q, kv_buffer, qo_indptr, kv_indptr, config,
+    q_scale=None, kv_scale=None, num_kv_splits=DEFAULT_KV_SPLITS,
+):
+    batch_size = config["batch_size"]
+    nq = config["num_heads"]
+    nkv = config["num_kv_heads"]
+    dq = config["qk_head_dim"]
+    dv = config["v_head_dim"]
+    q_seq_len = config["q_seq_len"]
+    total_kv_len = int(kv_indptr[-1].item())
+
+    kv_buffer_4d = kv_buffer.view(kv_buffer.shape[0], PAGE_SIZE, nkv, kv_buffer.shape[-1])
+    max_q_len = q_seq_len
+    kv_indices = torch.arange(total_kv_len, dtype=torch.int32, device="cuda")
+    kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
+
+    meta = _make_mla_decode_metadata(
+        batch_size, max_q_len, nq, nkv,
+        q.dtype, kv_buffer.dtype,
+        qo_indptr, kv_indptr, kv_last_page_len,
+        num_kv_splits=num_kv_splits,
+    )
+
+    o = torch.empty((q.shape[0], nq, dv), dtype=torch.bfloat16, device="cuda")
+    mla_decode_fwd(
+        q.view(-1, nq, dq),
+        kv_buffer_4d,
+        o,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        max_q_len,
+        page_size=PAGE_SIZE,
+        nhead_kv=nkv,
         sm_scale=SM_SCALE,
+        logit_cap=0.0,
+        num_kv_splits=num_kv_splits,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        intra_batch_mode=True,
+        **meta,
     )
-    return output
+    return o
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def custom_kernel(data: input_t) -> output_t:
+    q, kv_data, qo_indptr, kv_indptr, config = data
+    bs = config["batch_size"]
+    kvlen = config["kv_seq_len"]
+
+    # Pick optimal num_kv_splits for this config
+    num_kv_splits = KV_SPLITS_MAP.get((bs, kvlen), DEFAULT_KV_SPLITS)
+
+    # Adaptive Q dtype: skip fp8 quantization for small batches
+    use_fp8_q = (Q_FP8_BS_THRESHOLD > 0 and bs >= Q_FP8_BS_THRESHOLD) or \
+                (Q_FP8_BS_THRESHOLD == 0)
+
+    if use_fp8_q:
+        q_input, q_scale = quantize_fp8(q)
+    else:
+        q_input, q_scale = q, None
+
+    # Always use fp8 KV (pre-quantized, no overhead)
+    kv_buffer_fp8, kv_scale = kv_data["fp8"]
+
+    return _mla_decode(
+        q_input, kv_buffer_fp8, qo_indptr, kv_indptr, config,
+        q_scale=q_scale, kv_scale=kv_scale,
+        num_kv_splits=num_kv_splits,
+    )
