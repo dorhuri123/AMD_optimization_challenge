@@ -1,151 +1,178 @@
-# Challenge 3: MXFP4 GEMM
+# mxfp4-mm: MXFP4 Matrix Multiply (A4W4)
 
 **Owner:** Person B
 **Deadline:** April 6, 2026
 **Hardware:** AMD Instinct MI355X (CDNA3)
+**Official spec:** [amd_202602/mxfp4-mm](https://github.com/gpu-mode/reference-kernels/tree/main/problems/amd_202602/mxfp4-mm)
+*(No separate README in the official repo — spec is in `task.py` and `task.yml`)*
 
 ---
 
-## What Is MXFP4?
+## What This Challenge Is
 
-MXFP4 (Microscaling FP4) is a block quantization format where:
-- Each value uses **4 bits**
-- Every **32 values** share one FP8 scaling factor (the "microscale")
-- The MI355X has **native hardware support** for MXFP4 matrix cores
+Implement a fast **A4W4 GEMM**: given bf16 activations A and pre-quantized MXFP4 weights B, quantize A online to MXFP4 and run the GEMM on MI355X.
 
-This enables up to **4x higher peak throughput vs FP16** on MI355X — but only if the kernel correctly feeds the matrix cores fast enough to keep them saturated.
+This is the building block for the MoE challenge — the same kernel drives both Stage 1 and Stage 2 of every expert.
 
-GEMM accounts for ~62% of end-to-end compute in large transformer models (e.g., Llama2-70B), making this challenge the highest compute-impact optimization.
+## Task Interface
 
-## MXFP4 Format Details
+```python
+# Input tuple: (A, B, B_q, B_shuffle, B_scale_sh)
+A          # [m, k]          bfloat16   — activations (to be quantized online)
+B          # [n, k]          bfloat16   — original weights (for reference/dequant check only)
+B_q        # [n, k//2]       fp4x2      — B quantized to MXFP4, raw layout
+B_shuffle  # [n, k//2]       fp4x2      — B_q after shuffle_weight((16,16)) for CK
+B_scale_sh # [...]           e8m0       — block scales, e8m0_shuffled (from quant(B, shuffle=True))
 
+# Output: C [m, n] bfloat16
 ```
-Block layout (32 elements):
-  [e0, e1, ..., e31]  — each 4-bit FP4 value
-  [scale]             — one FP8 exponent shared across the block
 
-FP4 value range:   ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}  (e2m1 format)
-Scale (FP8 e8m0):  power-of-2 shared exponent
+What your `custom_kernel` must do:
 
-Actual value = e_i * 2^scale
-```
+1. Quantize A to MXFP4 (per_1x32 dynamic block quantization)
+2. Run `gemm_a4w4(A_q, B_shuffle, xscale=A_scale, wscale=B_scale_sh, bpreshuffle=True)`
+
+Constraints:
+
+- M, N divisible by 64
+- K divisible by 64 (scale group 32 × fp4 pack 2)
+- Output dtype: bfloat16
+
+## MXFP4 Format
+
+| Property | Value |
+| --- | --- |
+| FP4 format | E2M1 — values `{0, 0.5, 1, 1.5, 2, 3, 4, 6}`, max=6.0 |
+| Scale format | E8M0 — exponent-only (power-of-2) |
+| Block size | 32 values per scale |
+| Packing | 2 FP4 values per byte (fp4x2): low nibble=even index, high nibble=odd index |
+| Weight shuffle | `shuffle_weight(B_q, layout=(16,16))` — tile-coalesced for CK GEMM instructions |
+| Scale shuffle | `fp4_utils.e8m0_shuffle(scale)` — reorders scales to match shuffled weight layout |
 
 ## Files
 
 | File | Purpose |
-|------|---------|
-| `reference.py` | Baseline from gpu-mode/reference-kernels — do not modify |
-| `solution.py` | Our optimized GEMM kernel — edit this |
-| `benchmark.py` | Performance comparison across matrix shapes |
-
-## Getting the Official Baseline
-
-```bash
-cp $REF_KERNELS_DIR/AMD/mxfp4-gemm/reference.py ./reference.py
-cp $REF_KERNELS_DIR/AMD/mxfp4-gemm/task.py ./task.py
-cp $REF_KERNELS_DIR/AMD/mxfp4-gemm/task.yml ./task.yml
-```
+| --- | --- |
+| `reference.py` | AITER `gemm_a4w4` baseline — do not modify |
+| `task.py` | `input_t`, `output_t`, `TestSpec` definitions |
+| `task.yml` | 6 benchmark configs (leaderboard uses geometric mean) |
+| `submission.py` | **Edit this** — `custom_kernel(data)` implementation |
+| `benchmark.py` | reference vs submission latency + TFLOPS table |
 
 ## Running
 
 ```bash
-cd mxfp4-gemm
-python reference.py
-python solution.py
-python benchmark.py
+cd mxfp4-mm
+python reference.py    # verify baseline
+python benchmark.py    # reference vs your submission
+popcorn submit submission.py --problem mxfp4-mm
 ```
 
-## Submission
+## Accuracy Target
 
-```bash
-popcorn submit solution.py --problem mxfp4-gemm
+Validated against `run_torch_fp4_mm` (dequant + bf16 matmul) with `rtol=1e-02, atol=1e-02`.
+
+## Benchmark Configs (from task.yml)
+
+Shapes reflect actual DeepSeek-R1 weight dimensions (tokens × hidden):
+
+| m | n | k | Notes |
+| --- | --- | --- | --- |
+| 4 | 4096 | 7168 | decode, single token |
+| 16 | 4096 | 7168 | small decode batch |
+| 64 | 4096 | 7168 | |
+| 128 | 4096 | 7168 | |
+| 256 | 4096 | 7168 | |
+| 256 | 7168 | 4096 | down-proj shape |
+
+Small M is the hard case — matrix cores are underutilized when M is tiny, and memory bandwidth dominates.
+
+---
+
+## Optimization Opportunities
+
+The reference is `aiter.gemm_a4w4(bpreshuffle=True)`. The bottleneck moves depending on M:
+
+- **Small M (4–64):** memory-bandwidth bound — A is tiny, B weights dominate HBM reads
+- **Large M (256+):** compute-bound — feed matrix cores fast enough
+
+### 1. Fuse A Quantization into the GEMM Prologue (highest impact)
+
+The reference quantizes A in a **separate pass** (write fp4x2 + scale to HBM, then read back in GEMM). Fusing saves one full activation write + read:
+
+```text
+Current:  A (bf16) → [quant kernel] → A_q (fp4x2) [HBM] → [gemm_a4w4]
+Fused:    A (bf16) → [quant in GEMM prologue, stays in registers] → [gemm_a4w4]
 ```
 
-## Optimization Spaces (in priority order)
+This is the same pattern as the MoE activation fusion and the core insight of vLLM PR #36297.
 
-### 1. Native Matrix Core Usage
-MI355X matrix cores natively process MXFP4 — the key is ensuring we are actually using them.
-- Use `rocprof` to verify matrix core utilization (look for `SQ_INSTS_VALU_MFMA_*` counters)
-- If utilization is low, the kernel is not feeding data fast enough → add double-buffering
+### 2. Tile Size Tuning for MI355X
 
-### 2. Double-Buffering (Async Prefetch)
-Overlap HBM tile loading with matrix core compute:
+MI355X matrix cores have different optimal tile dimensions vs MI300X. The CK kernel has fixed tile sizes — a Triton kernel lets you autotune:
+
 ```python
-# Triton: use tl.async_copy + pipeline stages
-# Target: while computing tile K, prefetch tile K+1 from HBM
-```
-
-### 3. Tile Size Tuning for MI355X
-MI355X has different matrix core tile dimensions vs MI300X. Profile and tune:
-```python
-# Key Triton autotuning parameters:
+# Key parameters (BLOCK_K must be multiple of 32 for MXFP4 block alignment):
 BLOCK_M = [16, 32, 64, 128]
-BLOCK_N = [16, 32, 64, 128]
-BLOCK_K = [32, 64, 128]        # must be multiple of MXFP4 block size (32)
-num_stages = [2, 3, 4]         # pipeline depth
+BLOCK_N = [64, 128, 256]
+BLOCK_K = [32, 64, 128]
+num_stages = [2, 3, 4]    # pipeline depth for double/triple buffering
 num_warps  = [4, 8]
 ```
 
-### 4. Scale Factor Prefetch
-The FP8 scale factors (one per 32 elements) must be loaded alongside the data.
-- Pack scale loads with data loads to avoid separate HBM accesses
-- Keep scales in shared memory across the K-loop
+### 3. Double-Buffering (Async Prefetch)
 
-### 5. Stream-K Decomposition
-Standard data-parallel GEMM has load-imbalance for non-square shapes.
-Stream-K assigns work in K-dimension strips for better warp utilization:
-- Particularly important for tall-skinny (large M, small N) and wide (small M, large N) matrices
-- Reference: [Stream-K paper](https://arxiv.org/abs/2301.03598)
+For larger M, overlap HBM B-weight tile loading with matrix core compute on the previous tile:
 
-### 6. Persistent Kernels
-For many small GEMMs (MoE context), kernel launch overhead adds up.
-A persistent kernel stays alive and processes multiple tiles in sequence:
 ```python
-# One kernel launch handles all tiles via a work queue
+# Triton: num_stages=3 or 4 enables the compiler to emit async copy + barrier
+# Target: while computing tile K_i, prefetch B tile K_{i+1} from HBM
 ```
 
-### 7. Mixed Precision (MXFP4 weights + MXFP6 activations)
-AMD research shows MXFP4 weights + MXFP6 activations maintain accuracy better than pure MXFP4.
-Check if the task spec allows this variant.
+Particularly effective for the large-M configs (m=256) where compute time is long enough to hide the prefetch latency.
 
-## Key Performance Targets
+### 4. Scale Factor Load Coalescing
 
-| Shape (M×N×K) | Expected TFLOPS | Notes |
-|---|---|---|
-| 4096×4096×4096 | ~1200+ TFLOPS | Large square, compute-bound |
-| 128×4096×4096 | ~300+ TFLOPS | Small M, memory-bound |
-| 4096×128×4096 | ~300+ TFLOPS | Small N, memory-bound |
+Each E8M0 scale covers 32 elements. Scale loads must be coalesced with the corresponding fp4x2 data loads to avoid a second HBM round-trip. Ensure:
 
-MI355X peak MXFP4 compute: ~2457 TFLOPS (matrix cores)
+- Scale tensor is accessed with the same stride pattern as the weight tensor
+- Scale values are kept in shared memory across the K-loop iterations within a tile
 
-## Useful Starting Point: CK Templates
+### 5. Small-M Kernel Path
 
-Composable Kernel (CK) has pre-tuned MXFP4 GEMM templates. Study these before writing from scratch:
+For m=4–16, matrix cores are often idle waiting for data. A separate small-M kernel path can:
 
-```bash
-git clone https://github.com/ROCm/composable_kernel
-# Look in: composable_kernel/include/ck_tile/ops/gemm/
-# And:     composable_kernel/example/ck_tile/14_mxfp4_gemm/
-```
+- Use a wider BLOCK_N to amortize B-weight loads across more output columns
+- Reduce grid size to match the actual number of active CUs
+- Skip async copy (prefetch doesn't help when compute finishes before the next tile arrives)
+
+### 6. Stream-K Decomposition
+
+For non-square shapes (m=4, n=4096, k=7168), standard data-parallel GEMM wastes CUs — most blocks finish early while a few large-K blocks are still running. Stream-K distributes work in K-strips for uniform CU load.
+
+---
 
 ## Profiling
 
 ```bash
-# Check matrix core utilization
-rocprof --stats --counter SQ_INSTS_VALU_MFMA_I32_16X16X32_FP8 python solution.py
+# Matrix core utilization — are we actually using FP4 instructions?
+rocprof --stats --counter SQ_INSTS_VALU_MFMA_F32_16X16X32_FP8 python benchmark.py
 
-# Full HW analysis
-omniperf profile --name gemm_run -- python solution.py
-omniperf analyze -p workloads/gemm_run/ --dispatch 0
+# Full roofline analysis
+omniperf profile --name mm -- python benchmark.py
+omniperf analyze -p workloads/mm/
+# Check: VALU utilization vs theoretical peak, HBM BW utilization
 
-# Roofline: are we compute-bound or memory-bound?
-# If TFLOPS << peak AND memory BW utilization is high → memory-bound → add prefetching
-# If TFLOPS << peak AND memory BW low → compute kernel not using matrix cores properly
+# Quick roofline sanity
+# MI355X: ~2457 TFLOPS FP4, ~6.5 TB/s HBM3e
+# For m=256, n=4096, k=7168: arithmetic intensity = 2*256*4096*7168 / (256*7168 + 4096*7168) bytes
+# ~ 2*256*4096*7168 / (7168*(256+4096)) bytes = ~476 FLOP/byte → compute-bound
+# For m=4: ~7.4 FLOP/byte → memory-bound
 ```
 
 ## References
 
 - [MXFP4 quantization on AMD MI355X](https://rocm.blogs.amd.com/software-tools-optimization/mxfp4-mxfp6-quantization/README.html)
-- [CK MXFP4 GEMM](https://github.com/ROCm/composable_kernel)
+- [aiter gemm_a4w4 tests](https://github.com/ROCm/aiter/blob/main/op_tests/test_gemm_a4w4.py)
+- [CK MXFP4 GEMM templates](https://github.com/ROCm/composable_kernel)
 - [Triton for ROCm](https://rocm.docs.amd.com/en/latest/how-to/llm-fine-tuning-guide/triton.html)
-- [MI355X architecture specs](https://www.amd.com/en/products/accelerators/instinct/mi300/mi355x.html)
