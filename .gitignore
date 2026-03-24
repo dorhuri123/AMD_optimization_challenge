@@ -24,6 +24,9 @@ omniperf_*/
 .vscode/
 .idea/
 
+# Claude internals
+.claude/
+
 # Don't commit reference baseline files (fetch from gpu-mode/reference-kernels)
 */reference.py
 */task.py

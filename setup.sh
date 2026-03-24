@@ -96,7 +96,37 @@ info "Running environment verification..."
 python "$(cd "$(dirname "$0")" && pwd)/scripts/verify_env.py" || warn "Verification had warnings — see above."
 
 echo ""
+# ── 8. Copy reference files from the official challenge folder ────────────────
+CHALLENGE_DIR="${REF_KERNELS_DIR}/problems/amd_202602"
+REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [ -d "$CHALLENGE_DIR" ]; then
+    info "Copying reference files from amd_202602..."
+
+    # Shared eval + utils
+    cp "$CHALLENGE_DIR/eval.py"  "$REPO_DIR/eval.py"
+    cp "$CHALLENGE_DIR/utils.py" "$REPO_DIR/utils.py"
+
+    # Per-challenge: reference.py, task.py, task.yml
+    for challenge in mixed-mla mxfp4-mm moe-mxfp4; do
+        src="$CHALLENGE_DIR/$challenge"
+        dst="$REPO_DIR/$challenge"
+        if [ -d "$src" ]; then
+            cp "$src/reference.py" "$dst/reference.py"
+            cp "$src/task.py"      "$dst/task.py"
+            cp "$src/task.yml"     "$dst/task.yml"
+            info "  $challenge: reference.py, task.py, task.yml copied"
+        else
+            warn "  $challenge: folder not found in reference-kernels ($src)"
+        fi
+    done
+else
+    warn "reference-kernels not found at ${CHALLENGE_DIR} — skipping file copy"
+    warn "Run: git clone https://github.com/gpu-mode/reference-kernels ${REF_KERNELS_DIR}"
+    warn "Then re-run: bash setup.sh"
+fi
+
 info "Setup complete! Next steps:"
 echo "  1. source .env"
 echo "  2. popcorn login"
-echo "  3. cd mla-decode && python reference.py"
+echo "  3. cd mixed-mla && python reference.py"
