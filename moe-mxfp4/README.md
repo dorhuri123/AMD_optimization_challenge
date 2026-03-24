@@ -1,157 +1,202 @@
-# Challenge 1: MXFP4 MoE (Mixture of Experts)
+# moe-mxfp4: MXFP4 Mixture-of-Experts Fused Kernel
 
-**Owner:** Person B (builds on MXFP4 GEMM work)
+**Owner:** Person B
 **Deadline:** April 6, 2026
 **Hardware:** AMD Instinct MI355X (CDNA3)
+**Official spec:** [amd_202602/moe-mxfp4](https://github.com/gpu-mode/reference-kernels/tree/main/problems/amd_202602/moe-mxfp4)
 
 ---
 
-## What Is MoE?
+## What This Challenge Is
 
-Mixture of Experts (MoE) replaces a single FFN layer with N expert FFNs, routing each token to the top-K experts. This enables models like DeepSeek-V3 (671B total, ~37B active) and gpt-oss (120B total, 4 active experts per token) to run efficiently.
+Implement a DeepSeek-R1 style MXFP4 MoE fused kernel that beats AITER's `fused_moe` reference on MI355X.
 
-The challenge: optimize the MoE layer with **MXFP4-quantized expert weights** on AMD MI355X.
+The kernel fuses a **2-stage pipeline** across all tokens and experts:
 
-**Target model: gpt-oss**
-- 128 experts total (or 32 for 20B variant)
-- Each token routes to **top-4 experts**
-- No shared expert (unlike DeepSeek's architecture)
-- Expert weights stored in MXFP4
+1. **Stage 1:** MXFP4 GEMM (gate + up projection) + SwiGLU activation
+2. **Stage 2:** MXFP4 GEMM (down projection) + weighted reduction across top-k experts
 
-## MoE Forward Pass
+## DeepSeek-R1 MoE Architecture
+
+| Parameter | Value | Notes |
+| --- | --- | --- |
+| hidden_size | 7168 | Model hidden dimension |
+| moe_intermediate_size | 2048 | Per-expert intermediate dim (full, EP-off splits to 256) |
+| n_routed_experts | 256 | Routed experts per GPU (EP-off) or 32 (EP=8) |
+| n_shared_experts | 1 | Always selected, weight = 1.0 |
+| top_k (routed) | 8 | Routed experts per token |
+| total_top_k | **9** | 8 routed + 1 shared |
+| E_total | **257** | 256 + 1 shared (EP-off) or 33 (EP=8) |
+
+## Kernel Flow
 
 ```
-Input tokens: [batch * seq_len, hidden_dim]
-                    │
-                    ▼
-            Router (linear layer)
-                    │
-                    ▼
-           topK scores + expert indices
-                    │
-                    ▼
-        Sort/scatter tokens to experts
-                    │
-              ┌─────┴─────┐
-          Expert 0    Expert 1  ...  Expert N
-          GEMM1+Act   GEMM1+Act      GEMM1+Act   ← MXFP4 weights
-          GEMM2       GEMM2          GEMM2
-              └─────┬─────┘
-                    │
-              Gather + weighted sum
-                    │
-                    ▼
-                   Output
+For each token i and each assigned expert j:
+
+(1) Quant: hidden_states → MXFP4  (aiter per-1x32 dynamic, block_size=32)
+
+(2) Stage 1 GEMM + SwiGLU:
+    gate = x_i @ W_gate_j.T          [d_hidden → d_expert]
+    up   = x_i @ W_up_j.T            [d_hidden → d_expert]
+    h    = SiLU(gate) * up            ← SwiGLU activation
+    (W_gate and W_up fused as one a4w4 GEMM)
+
+(3) Stage 2 GEMM:
+    expert_out = h @ W_down_j.T       [d_expert → d_hidden]
+
+(4) Weighted reduction:
+    output_i += w_ij * expert_out     ← accumulate across top_9 experts
 ```
 
-**The bottleneck shifts by batch size:**
-- Small batch (decode): routing/sorting overhead dominates
-- Large batch (prefill): GEMM throughput dominates
+All GEMMs are **a4w4** (MXFP4 activations × MXFP4 weights, per-1x32 block scaling).
+
+## Input Tuple (12 elements)
+
+```python
+(
+  hidden_states,                  # [M, d_hidden]                            bf16
+  gate_up_weight,                 # [E, 2*d_expert_pad, d_hidden_pad//2]     fp4x2  (raw)
+  down_weight,                    # [E, d_hidden_pad, d_expert_pad//2]       fp4x2  (raw)
+  gate_up_weight_scale,           # [E, 2*d_expert_pad, d_hidden_pad//32]    e8m0   (raw)
+  down_weight_scale,              # [E, d_hidden_pad, d_expert_pad//32]      e8m0   (raw)
+  gate_up_weight_shuffled,        # [E, 2*d_expert_pad, d_hidden_pad//2]     fp4x2  (pre-shuffled 16x16)
+  down_weight_shuffled,           # [E, d_hidden_pad, d_expert_pad//2]       fp4x2  (pre-shuffled 16x16)
+  gate_up_weight_scale_shuffled,  # [padded, flat]                           e8m0   (shuffled)
+  down_weight_scale_shuffled,     # [padded, flat]                           e8m0   (shuffled)
+  topk_weights,                   # [M, 9]                                   float32
+  topk_ids,                       # [M, 9]  cols 0-7: routed, col 8: shared  int32
+  config,                         # dict: d_hidden, d_expert, pads, expert counts
+)
+```
+
+## MXFP4 Format
+
+| Property | Value |
+| --- | --- |
+| FP4 format | E2M1 — values `{0, 0.5, 1, 1.5, 2, 3, 4, 6}`, max=6.0 |
+| Scale format | E8M0 — exponent-only (power-of-2) |
+| Block size | 32 elements per scale |
+| Packing | 2 FP4 values per byte (fp4x2): low nibble=even, high nibble=odd |
+| Padding | Dims padded to 256-alignment for CK kernel |
 
 ## Files
 
 | File | Purpose |
-|------|---------|
-| `reference.py` | Baseline from gpu-mode/reference-kernels — do not modify |
-| `solution.py` | Our optimized MoE kernel — edit this |
-| `benchmark.py` | Performance comparison across batch sizes |
-
-## Getting the Official Baseline
-
-```bash
-cp $REF_KERNELS_DIR/AMD/mxfp4-moe/reference.py ./reference.py
-cp $REF_KERNELS_DIR/AMD/mxfp4-moe/task.py ./task.py
-cp $REF_KERNELS_DIR/AMD/mxfp4-moe/task.yml ./task.yml
-```
+| --- | --- |
+| `reference.py` | AITER `fused_moe` baseline — do not modify |
+| `task.py` | `input_t`, `output_t`, `TestSpec` definitions |
+| `task.yml` | 6 benchmark configs (leaderboard uses geometric mean) |
+| `submission.py` | **Edit this** — `custom_kernel(data)` implementation |
+| `benchmark.py` | reference vs submission latency table |
 
 ## Running
 
 ```bash
-cd mxfp4-moe
-python reference.py
-python solution.py
-python benchmark.py
+cd moe-mxfp4
+python reference.py    # verify baseline
+python benchmark.py    # reference vs your submission
+popcorn submit submission.py --problem moe-mxfp4
 ```
 
-## Submission
+## Accuracy Target
+
+Validated against AITER reference with `rtol=1e-2, atol=1e-2`.
+
+## Reference Performance (AITER `fused_moe` on MI355X)
+
+| bs | E | d_expert | top_k | time (μs) |
+| --- | --- | --- | --- | --- |
+| 4 | 257 | 256 | 9 | 46.9 |
+| 64 | 257 | 256 | 9 | 187.7 |
+| 256 | 257 | 256 | 9 | 245.7 |
+| 64 | 33 | 2048 | 9 | 220.6 |
+| 256 | 33 | 2048 | 9 | 276.4 |
+| 1024 | 33 | 2048 | 9 | 572.2 |
+
+Ranking = geometric mean latency across all 6 configs.
+
+---
+
+## Optimization Opportunities
+
+The following are taken directly from the [official README](https://github.com/gpu-mode/reference-kernels/tree/main/problems/amd_202602/moe-mxfp4) plus our own analysis. The AITER CK `fused_moe` kernel is already well-optimized — beating it requires at least one of these.
+
+### 1. Activation Quantization Fusion (highest impact)
+
+The reference quantizes activations to MXFP4 in a **separate kernel** before Stage 1 GEMM. This writes quantized activations to HBM, then reads them back for the GEMM.
+
+Fusing dynamic MXFP4 quantization into the Stage 1 GEMM prologue saves one full activation-tensor write + read:
+
+```text
+Current:  hidden (bf16) → [quant kernel] → activations (fp4x2) [HBM] → [GEMM]
+Fused:    hidden (bf16) → [quant in GEMM prologue, stays in registers] → [GEMM]
+```
+
+### 2. Inter-Stage Fusion (Stage 1 + Stage 2 in one kernel)
+
+The reference runs Stage 1 and Stage 2 as separate kernel launches. The intermediate buffer (`h = SwiGLU(gate_up_output)`) is written to HBM between stages.
+
+Fusing both stages eliminates this intermediate buffer:
+
+```text
+Current:  [Stage1 kernel] → h [HBM] → [Stage2 kernel] → output [HBM]
+Fused:    [single kernel: Stage1 → SwiGLU → Stage2 → weighted reduce]
+```
+
+This is the most ambitious fusion — requires enough shared memory or register space to hold the intermediate activation tile.
+
+### 3. Shared Expert Fusion
+
+The shared expert (index 256) is **always selected for every token** with weight=1.0. It never needs routing — it's just a dense GEMM over all M tokens.
+
+The reference treats it identically to routed experts (included in the top-k loop). A custom kernel can:
+
+- Compute the shared expert as a standard dense a4w4 GEMM (no routing overhead, better utilization)
+- Fuse its output directly into the weighted reduction accumulator
+
+### 4. Custom Expert Dispatch / Wave Scheduling
+
+With E=257 experts but only 9 active per token, most expert slots receive zero tokens. The CK kernel uses a fixed tile strategy that may launch empty wavefronts for inactive experts.
+
+A compact dispatch strategy:
+
+- Only launch blocks for experts that actually receive tokens (`tokens_per_expert[e] > 0`)
+- Particularly impactful at small batch sizes (bs=4, 64) where few experts are hot
+
+### 5. Split-K for Large M (EP-on config)
+
+For the EP-on benchmarks (bs=1024, E=33, d_expert=2048), each expert receives ~280 tokens on average. The GEMMs are large enough that split-K parallelism within a single expert reduces latency by giving multiple CU groups work on the same expert's GEMM.
+
+### 6. Custom Tiling / Scheduling for Small Batch
+
+At bs=4 with E=257 experts, each expert sees ~0.14 tokens on average (mostly 0, occasionally 1). The CK kernel's tile sizes are tuned for larger M. A custom schedule that batches multiple near-empty experts into a single block can improve occupancy.
+
+---
+
+## Profiling
 
 ```bash
-popcorn submit solution.py --problem mxfp4-moe
-```
-
-## Optimization Spaces (in priority order)
-
-### 1. Grouped GEMM for Variable Expert Batch Sizes
-Each expert sees a different number of tokens per step. A naïve loop over experts wastes GPU occupancy.
-- Use a single "grouped GEMM" kernel with variable-size problem descriptors
-- CK provides `DeviceGroupedGemm` template — study it first
-- Triton alternative: `tl.constexpr`-based static loop unrolling won't work; use dynamic dispatch
-
-```python
-# Pseudo-structure for grouped GEMM:
-# problems = [(M_0, N, K, A_ptr_0, B_ptr_0, C_ptr_0), ..., (M_127, N, K, ...)]
-# One kernel launch processes all problems
-```
-
-### 2. Fused TopK Sort + Expert Dispatch
-The routing pipeline: `router_logits → softmax → topK → sort by expert_id → scatter`.
-The sort step is O(batch × K × log(N_experts)) and becomes the bottleneck at long contexts.
-
-Optimization directions:
-- Replace sort with **counting sort** (N_experts=128 → O(batch × K + N_experts))
-- Fuse the scatter/gather into the GEMM kernel's index computation
-- Use shared memory for the expert token count histogram
-
-### 3. Online MXFP4 Activation Quantization
-If the task requires MXFP4 activations (not just weights):
-- Quantize activations inline in the dispatch kernel — avoid a separate quantization pass
-- Each block of 32 activation values: compute max, derive FP8 scale, write FP4 values
-
-### 4. Expert Weight Caching in Shared Memory
-For small batches where the same expert is selected repeatedly:
-- Pre-load frequently used expert weights into shared memory
-- Amortize HBM load cost across multiple tokens routed to the same expert
-
-### 5. Dynamic Grid Sizing
-Naïve approach: launch a fixed grid and check `if expert_id == my_expert` — wastes threads.
-Better: launch exactly `sum(tokens_per_expert_i > 0)` blocks, each assigned to one expert.
-
-### 6. Kernel Fusion Budget Target
-Production systems target **3–4 kernel launches** per MoE forward pass:
-1. Router + topK
-2. Sort/scatter
-3. Grouped GEMM (GEMM1 + activation)
-4. Grouped GEMM (GEMM2) + weighted sum
-
-Current vLLM uses 7 kernels — halving this halves launch overhead on large-batch decode.
-
-## Key Profiling Questions
-
-1. **Where is the time?** At decode batch sizes (1–16), is it routing or GEMM?
-2. **Expert load balance?** Measure token count per expert — uneven distribution hurts utilization.
-3. **Memory access pattern?** MXFP4 weights are 4-bit but need 8-bit scale fetches — are these coalesced?
-
-```bash
-# Profile at different batch sizes
-for bs in 1 8 32 128 512 2048; do
-    echo "=== batch=$bs ===" && python benchmark.py --batch_size $bs
+# Where is the time for each config?
+for bs in 4 64 256 1024; do
+    echo "=== bs=$bs ===" && python -c "
+import torch; from reference import generate_input, ref_kernel
+import triton
+data = generate_input(dhidden=7168, dexpert=256 if $bs<=256 else 2048,
+    nroutedexperts=256 if $bs<=256 else 32, nexpertspertoken=8,
+    nsharedexperts=1, bs=$bs, seed=0)
+t = triton.testing.do_bench(lambda: ref_kernel(data))
+print(f'bs=$bs: {t:.3f} ms')
+"
 done
 
-# HW counters
-rocprof --stats --counter SQ_INSTS_VALU_MFMA_I32_16X16X32_FP8 python solution.py
-omniperf profile --name moe_run -- python solution.py
+# Deep HW analysis
+omniperf profile --name moe -- python benchmark.py
+omniperf analyze -p workloads/moe/
 ```
-
-## Relationship to MXFP4 GEMM Challenge
-
-The MoE challenge is MXFP4 GEMM + routing logic. Complete the GEMM challenge first:
-- The grouped GEMM kernel here reuses the MXFP4 GEMM tile structure
-- Tile sizes, prefetching, and scale-factor handling are identical
-- Only difference: variable M per expert instead of fixed M
 
 ## References
 
-- [AITER FusedMoE operators](https://github.com/ROCm/aiter)
-- [vLLM MoE kernel](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/)
+- [Official moe-mxfp4 README](https://github.com/gpu-mode/reference-kernels/tree/main/problems/amd_202602/moe-mxfp4)
+- [ROCm/aiter fused_moe](https://github.com/ROCm/aiter)
+- [MXFP4 quantization on AMD](https://rocm.blogs.amd.com/software-tools-optimization/mxfp4-mxfp6-quantization/README.html)
 - [CK GroupedGemm](https://github.com/ROCm/composable_kernel)
-- [MXFP4 MoE on AMD blog](https://rocm.blogs.amd.com/software-tools-optimization/mxfp4-mxfp6-quantization/README.html)
