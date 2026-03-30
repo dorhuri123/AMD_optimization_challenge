@@ -188,39 +188,57 @@ Different kernel per config:
 
 ## Prompt to Start Next Session
 
+Copy-paste this into a new Claude Code chat (replace `<PUT_IP_HERE>` with Hot Aisle VM IP):
+
 ```
 I'm continuing work on the AMD x GPU MODE mixed-MLA decode optimization challenge.
 
-Current state: v2.0 at 92.534 μs geomean on MI355X. Top 1 is 12.7 μs.
+Current state: v2.0 at 92.534 μs geomean on MI355X. Top 1 is 12.7 μs (~7x gap).
 Repo: github.com/dorhuri123/AMD_optimization_challenge (PRIVATE, branch: mixed-mla-dev)
-
-Read mixed-mla/SESSION_HANDOFF.md for full context — it has setup instructions,
-profiling data, 5 optimization paths ranked by priority, and all research done so far.
-
-Next priority: Path A (bare Triton FP8 decode to skip AITER overhead) and/or
-Path B (tl.dot_scaled MXFP4 for MI355X hardware). Also consider Path C (CK kernel)
-and Path D (ASM) for maximum performance.
-
-Hot Aisle MI300X SSH: ssh hotaisle@<IP> -i ~/.ssh/id_ed25519
-Popcorn submit locally: popcorn-cli submit --gpu MI355X --leaderboard amd-mixed-mla --mode leaderboard --no-tui submission.py
 Deadline: April 6, 2026.
+
+Read mixed-mla/SESSION_HANDOFF.md FIRST — it has the full context, GPU setup, profiling data, and 5 ranked optimization paths.
+
+Hot Aisle MI300X SSH: ssh hotaisle@<PUT_IP_HERE> -i ~/.ssh/id_ed25519
+Popcorn submit (local, no GPU needed): popcorn-cli submit --gpu MI355X --leaderboard amd-mixed-mla --mode leaderboard --no-tui submission.py
+
+Work in parallel using Agent teams:
+
+Agent 1 "research": Read SESSION_HANDOFF.md, then deep-dive into AITER source code (aiter/mla.py, aiter/ops/triton/_triton_kernels/attention/), CK MLA templates (composable_kernel/include/ck_tile/ops/mla/), and gfx950 ISA docs. Find concrete code patterns we can adapt. Focus on: how does fav3_sage_attention_mxfp4.py use tl.dot_scaled? Can we adapt CK's MLA decode for MXFP4 KV? What ASM instructions does the reference .co kernel use?
+
+Agent 2 "kernel-dev": Implement the highest-priority optimization path. Start with Path A (bare Triton FP8 decode kernel that skips AITER entirely — no metadata, no persistent mode, just direct grid launch). Then move to Path B (tl.dot_scaled MXFP4 for MI355X). Write the kernel, test on MI300X via SSH, iterate until correct and fast.
+
+Agent 3 "benchmark-submit": After kernel-dev produces a working version, run benchmark.py on the GPU, verify correctness, then submit via popcorn-cli. Record results in versions/ folder. Compare per-config latencies to find which configs improved and which need more work.
+
+All agents should coordinate — research findings feed into kernel-dev, kernel-dev outputs feed into benchmark-submit.
 ```
 
 ---
 
-## Agent Teams (Experimental)
+## Agent Teams
 
-Agent Teams requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in settings.json (already set).
-Teams are spawned dynamically during the conversation — no pre-defined files needed.
-Claude can launch sub-agents for parallel work using the Agent tool.
+Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in `~/.claude/settings.json` (already set).
+No config files needed — teams are spawned dynamically from the prompt above.
 
-### Suggested Division of Work
+### How It Works
 
-**When starting a session**, tell Claude to spawn these in parallel:
+Claude reads the prompt, then launches 3 sub-agents in parallel using the Agent tool:
 
-1. **"kernel-dev"** — Implement and iterate on kernel code (Triton/CK/ASM)
-2. **"benchmark-submit"** — Run benchmarks on GPU, submit via popcorn, track results
-3. **"research"** — Deep-dive into AITER source, CK templates, ISA docs for new optimizations
+1. **"research"** — reads code, fetches URLs, searches for patterns. Does NOT edit files.
+   - Reads AITER source: `aiter/mla.py`, attention kernels, codegen scripts
+   - Fetches CK MLA templates from GitHub
+   - Searches for gfx950 MFMA instruction docs
+   - Returns findings to the main agent for kernel-dev to use
 
-These run as sub-agents within the same conversation — they share context and can
-hand off results to each other. No separate config files needed.
+2. **"kernel-dev"** — writes and tests kernel code on the GPU via SSH.
+   - Implements Path A (bare Triton FP8) and Path B (tl.dot_scaled MXFP4)
+   - Pushes to repo, pulls on GPU, runs tests
+   - Iterates on correctness and performance
+
+3. **"benchmark-submit"** — runs after kernel-dev, handles submission pipeline.
+   - Runs `benchmark.py` on Hot Aisle MI300X
+   - Submits via `popcorn-cli` locally
+   - Saves results to `versions/` folder
+   - Reports per-config breakdown
+
+The main agent coordinates: passes research findings to kernel-dev, triggers benchmark-submit when a version is ready, decides which optimization path to pursue next based on results.
