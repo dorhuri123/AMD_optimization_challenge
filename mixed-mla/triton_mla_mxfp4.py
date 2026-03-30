@@ -232,7 +232,10 @@ def triton_mla_decode_mxfp4(
 
     # Squeeze KV head dim: (total_kv, 1, 288) → (total_kv, 288)
     kv_fp4_2d = kv_fp4.squeeze(1) if kv_fp4.dim() == 3 else kv_fp4
-    # Scale: (total_kv, 18) — already 2D from generate_input
+    # Cast to uint8 — Triton can't handle float4_e2m1fn_x2 dtype
+    kv_fp4_2d = kv_fp4_2d.view(torch.uint8)
+    # Scale might be e8m0 dtype — cast to uint8 too
+    kv_scale_u8 = kv_scale.view(torch.uint8) if kv_scale.dtype != torch.uint8 else kv_scale
 
     o = torch.empty((batch_size, NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16, device=q.device)
 
@@ -243,11 +246,11 @@ def triton_mla_decode_mxfp4(
 
     grid = (batch_size, NUM_HEADS)
     mla_decode_mxfp4_kernel[grid](
-        q, kv_fp4_2d, kv_scale, o, kv_indptr,
+        q, kv_fp4_2d, kv_scale_u8, o, kv_indptr,
         q.stride(0), q.stride(1),
         o.stride(0), o.stride(1),
         kv_fp4_2d.stride(0),
-        kv_scale.stride(0),
+        kv_scale_u8.stride(0),
         SM_SCALE,
         BLOCK_KV=BLOCK_KV,
         BLOCK_D=BLOCK_D,
