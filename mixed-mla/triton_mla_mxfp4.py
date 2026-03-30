@@ -180,6 +180,10 @@ def mla_stage1_kernel(
     tl.store(po_base + even_offsets, acc_even)
     tl.store(po_base + odd_offsets, acc_odd)
 
+    # Normalize partial output before storing
+    acc_even = acc_even / (l_prev + 1e-10)
+    acc_odd = acc_odd / (l_prev + 1e-10)
+
     # Store LSE (only from v_chunk 0 to avoid redundant writes)
     if pid_v == 0:
         # lse = m + log(l) in natural log
