@@ -2,13 +2,11 @@
 mxfp4-mm — custom_kernel submission
 ======================================
 FP4 quant + FP4 GEMM: bf16 A, MXFP4 B -> bf16 C, on AMD MI355X.
-Uses the same quant path as the reference (dynamic_mxfp4_quant from triton).
 """
 
 import torch
 import aiter
 from aiter import dtypes
-from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import e8m0_shuffle
 from task import input_t, output_t
@@ -30,14 +28,14 @@ def custom_kernel(data: input_t) -> output_t:
     # Quantize A to MXFP4
     A_q, A_scale = _quant_mxfp4(A, shuffle=True)
 
-    # A4W4 GEMM with pre-shuffled B
+    # A4W4 GEMM — use positional arg names matching the C++ binding
     C = aiter.gemm_a4w4(
         A_q,
         B_shuffle,
-        xscale=A_scale,
-        wscale=B_scale_sh,
+        A_scale,
+        B_scale_sh,
         bpreshuffle=True,
-        out_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
 
     return C
