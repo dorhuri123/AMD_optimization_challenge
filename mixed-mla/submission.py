@@ -36,21 +36,20 @@ FP8_DTYPE = aiter_dtypes.fp8
 # Map (batch_size, kv_seq_len) -> optimal num_kv_splits
 # Default to 32 (same as reference) until we have profiling data.
 KV_SPLITS_MAP = {
-    # (bs, kvlen): splits
-    (4, 1024): 32,
+    # Tuned on MI300X (2026-03-30). splits=8 crashes, 16 is optimal for most configs.
+    (4, 1024): 16,
     (4, 8192): 32,
-    (32, 1024): 32,
-    (32, 8192): 32,
-    (64, 1024): 32,
-    (64, 8192): 32,
-    (256, 1024): 32,
-    (256, 8192): 32,
+    (32, 1024): 16,
+    (32, 8192): 48,
+    (64, 1024): 16,
+    (64, 8192): 24,
+    (256, 1024): 16,
+    (256, 8192): 24,
 }
-DEFAULT_KV_SPLITS = 32
+DEFAULT_KV_SPLITS = 16
 
-# Batch size threshold: use bf16 Q (a16w8) below this, fp8 Q (a8w8) above.
-# Set to 0 to always use fp8 Q (same as reference).
-# TODO: tune on MI355X — try 16 or 32
+# a16w8 (bf16 Q) tested — always slower than a8w8 (fp8 Q) on MI300X.
+# Keep fp8 Q for all configs.
 Q_FP8_BS_THRESHOLD = 0
 
 
