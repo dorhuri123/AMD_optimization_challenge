@@ -2,7 +2,7 @@
 mixed-mla — custom_kernel submission
 =====================================
 DeepSeek R1 forward_absorb MLA decode, AMD MI355X.
-Matches the reference fp8 Q + fp8 KV path.
+fp8 Q + fp8 KV path (matches reference a8w8).
 """
 
 import torch
@@ -32,27 +32,44 @@ def _quant_fp8(x):
     return fp8, scale.to(torch.float32).reshape(1)
 
 
-def _make_metadata(batch_size, max_q_len, nq, nkv, q_dtype, kv_dtype,
-                   qo_indptr, kv_indptr, kv_last_page_len, num_kv_splits):
-    meta_info = get_mla_metadata_info_v1(
-        batch_size=batch_size,
-        max_q_len=max_q_len,
-        nq=nq,
-        nkv=nkv,
-        hq=QK_HEAD_DIM,
-        hv=V_HEAD_DIM,
-        num_kv_splits=num_kv_splits,
-        q_dtype=q_dtype,
-        kv_dtype=kv_dtype,
+def _make_metadata(batch_size, max_q_len, nhead, nhead_kv,
+                   q_dtype, kv_dtype, qo_indptr, kv_indptr,
+                   kv_last_page_len, num_kv_splits):
+    info = get_mla_metadata_info_v1(
+        batch_size, max_q_len, nhead, q_dtype, kv_dtype,
+        is_sparse=False, fast_mode=False,
+        num_kv_splits=num_kv_splits, intra_batch_mode=True,
     )
-    return get_mla_metadata_v1(
-        meta_info=meta_info,
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_last_page_len=kv_last_page_len,
+    work = [torch.empty(s, dtype=t, device="cuda") for s, t in info]
+    (work_metadata, work_indptr, work_info_set,
+     reduce_indptr, reduce_final_map, reduce_partial_map) = work
+
+    get_mla_metadata_v1(
+        qo_indptr, kv_indptr, kv_last_page_len,
+        nhead // nhead_kv,
+        nhead_kv,
+        True,  # is_causal
+        work_metadata, work_info_set, work_indptr,
+        reduce_indptr, reduce_final_map, reduce_partial_map,
         page_size=PAGE_SIZE,
-        num_kv_splits=num_kv_splits,
+        kv_granularity=max(PAGE_SIZE, 16),
+        max_seqlen_qo=max_q_len,
+        uni_seqlen_qo=max_q_len,
+        fast_mode=False,
+        max_split_per_batch=num_kv_splits,
+        intra_batch_mode=True,
+        dtype_q=q_dtype,
+        dtype_kv=kv_dtype,
     )
+
+    return {
+        "work_meta_data": work_metadata,
+        "work_indptr": work_indptr,
+        "work_info_set": work_info_set,
+        "reduce_indptr": reduce_indptr,
+        "reduce_final_map": reduce_final_map,
+        "reduce_partial_map": reduce_partial_map,
+    }
 
 
 def custom_kernel(data: input_t) -> output_t:
@@ -65,7 +82,7 @@ def custom_kernel(data: input_t) -> output_t:
     dv = config["v_head_dim"]
     q_seq_len = config["q_seq_len"]
 
-    # FP8 Q + FP8 KV path (matches reference)
+    # FP8 Q + FP8 KV
     q_fp8, q_scale = _quant_fp8(q)
     kv_buffer_fp8, kv_scale = kv_data["fp8"]
 
@@ -73,7 +90,9 @@ def custom_kernel(data: input_t) -> output_t:
     kv_indices = torch.arange(total_kv, dtype=torch.int32, device="cuda")
     kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
 
-    kv_buffer_4d = kv_buffer_fp8.view(kv_buffer_fp8.shape[0], PAGE_SIZE, nkv, kv_buffer_fp8.shape[-1])
+    kv_buffer_4d = kv_buffer_fp8.view(
+        kv_buffer_fp8.shape[0], PAGE_SIZE, nkv, kv_buffer_fp8.shape[-1]
+    )
 
     meta = _make_metadata(
         batch_size, q_seq_len, nq, nkv,
@@ -92,12 +111,16 @@ def custom_kernel(data: input_t) -> output_t:
         kv_indptr,
         kv_indices,
         kv_last_page_len,
-        sm_scale=SM_SCALE,
+        q_seq_len,
         page_size=PAGE_SIZE,
+        nhead_kv=nkv,
+        sm_scale=SM_SCALE,
+        logit_cap=0.0,
         num_kv_splits=NUM_KV_SPLITS,
         q_scale=q_scale,
         kv_scale=kv_scale,
-        meta=meta,
+        intra_batch_mode=True,
+        **meta,
     )
 
     return o
