@@ -1,15 +1,15 @@
 """
-Triton MLA decode with MXFP4 KV cache — v2.2
+Triton MLA decode with MXFP4 KV cache — v3.0 (single-pass, redundant softmax)
 
-Two-pass approach (simpler, avoids Triton slice-assignment issues):
-  Pass 1: Compute attention scores for all KV tokens → store in scratch buffer
-  Pass 2: Softmax scores × dequanted V → output
+Each program handles one (batch, head, v_chunk). The QK scores are recomputed
+redundantly by all 8 V-chunk programs (V_DIM=512/BLOCK_D=64 = 8 chunks), but
+this eliminates the HBM score scratch buffer entirely.
 
-Actually, for memory-bound decode this is fine — the 2x BW savings from MXFP4
-still wins even with 2 passes over KV.
+This is the same pattern used by sglang's production decode attention kernel.
+The 8x QK recomputation is cheap (compute-bound dot products) vs the HBM
+bandwidth saved by avoiding a (batch, heads, kv_seq_len) scratch buffer.
 
-Grid: (batch_size, NUM_HEADS)
-Each program: one query token × one head.
+Grid: (batch_size, NUM_HEADS, V_DIM // BLOCK_D)
 """
 
 import torch
@@ -76,30 +76,43 @@ def _dequant_block(
 
 
 @triton.jit
-def mla_score_kernel(
-    Q_ptr, KV_fp4_ptr, KV_scale_ptr, Score_ptr,
+def mla_decode_fused_kernel(
+    Q_ptr, KV_fp4_ptr, KV_scale_ptr, O_ptr,
     kv_indptr_ptr,
     stride_q_tok, stride_q_head,
     stride_kv_tok, stride_sc_tok,
-    stride_score_batch, stride_score_head,
+    stride_o_tok, stride_o_head,
     sm_scale,
-    max_kv_len,
     BLOCK_KV: tl.constexpr,
     BLOCK_D: tl.constexpr,
     QK_DIM: tl.constexpr,
+    V_DIM: tl.constexpr,
 ):
-    """Pass 1: Compute raw attention scores Q·K^T for all KV tokens."""
+    """Single-pass fused MLA decode with redundant QK scoring.
+
+    Grid: (batch, NUM_HEADS, V_DIM // BLOCK_D)
+    Each program: one V chunk, recomputes full QK scores independently.
+    """
     HALF_D: tl.constexpr = BLOCK_D // 2
+    LOG2E: tl.constexpr = 1.4426950408889634
 
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
+    pid_v = tl.program_id(2)
 
     kv_start = tl.load(kv_indptr_ptr + pid_b)
     kv_end = tl.load(kv_indptr_ptr + pid_b + 1)
     kv_len = kv_end - kv_start
 
     q_base = Q_ptr + pid_b * stride_q_tok + pid_h * stride_q_head
-    score_base = Score_ptr + pid_b * stride_score_batch + pid_h * stride_score_head
+    o_base = O_ptr + pid_b * stride_o_tok + pid_h * stride_o_head
+    vd_start = pid_v * BLOCK_D
+
+    # Online softmax state
+    m_prev = tl.full([], float("-inf"), dtype=tl.float32)
+    l_prev = tl.full([], 0.0, dtype=tl.float32)
+    acc_even = tl.zeros([HALF_D], dtype=tl.float32)
+    acc_odd = tl.zeros([HALF_D], dtype=tl.float32)
 
     num_tiles = tl.cdiv(kv_len, BLOCK_KV)
     for tile_idx in range(num_tiles):
@@ -108,8 +121,8 @@ def mla_score_kernel(
         mask_kv = kv_offsets < kv_len
         kv_idx = kv_start + kv_offsets
 
+        # ── Step 1: Compute QK scores (redundant across V chunks) ──
         scores = tl.zeros([BLOCK_KV], dtype=tl.float32)
-
         for d_tile in tl.static_range(QK_DIM // BLOCK_D):
             d_start = d_tile * BLOCK_D
             q_even_offs = d_start + tl.arange(0, HALF_D) * 2
@@ -128,83 +141,33 @@ def mla_score_kernel(
 
         scores = scores * sm_scale
         scores = tl.where(mask_kv, scores, float("-inf"))
-        tl.store(score_base + kv_offsets, scores, mask=mask_kv)
 
-
-@triton.jit
-def mla_value_kernel(
-    KV_fp4_ptr, KV_scale_ptr, Score_ptr, O_ptr,
-    kv_indptr_ptr,
-    stride_kv_tok, stride_sc_tok,
-    stride_score_batch, stride_score_head,
-    stride_o_tok, stride_o_head,
-    max_kv_len,
-    BLOCK_KV: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    V_DIM: tl.constexpr,
-):
-    """Pass 2: Softmax(scores) × V → output.
-
-    Each program handles one batch × one head × one V_DIM chunk of BLOCK_D dims.
-    Grid: (batch, NUM_HEADS, V_DIM // BLOCK_D)
-    """
-    HALF_D: tl.constexpr = BLOCK_D // 2
-
-    pid_b = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_v = tl.program_id(2)  # which V dim chunk
-
-    kv_start = tl.load(kv_indptr_ptr + pid_b)
-    kv_end = tl.load(kv_indptr_ptr + pid_b + 1)
-    kv_len = kv_end - kv_start
-
-    score_base = Score_ptr + pid_b * stride_score_batch + pid_h * stride_score_head
-
-    # First pass over scores to compute softmax normalizer
-    m_global = tl.full([], float("-inf"), dtype=tl.float32)
-    l_global = tl.full([], 0.0, dtype=tl.float32)
-    log2e: tl.constexpr = 1.4426950408889634
-
-    num_tiles = tl.cdiv(kv_len, BLOCK_KV)
-    for tile_idx in range(num_tiles):
-        tile_start = tile_idx * BLOCK_KV
-        kv_offsets = tile_start + tl.arange(0, BLOCK_KV)
-        mask_kv = kv_offsets < kv_len
-        s = tl.load(score_base + kv_offsets, mask=mask_kv, other=float("-inf"))
-        m_new = tl.maximum(m_global, tl.max(s, axis=0))
-        alpha = tl.math.exp2((m_global - m_new) * log2e)
-        p = tl.math.exp2((s - m_new) * log2e)
-        p = tl.where(mask_kv, p, 0.0)
-        l_global = l_global * alpha + tl.sum(p, axis=0)
-        m_global = m_new
-
-    # Second pass: weighted sum for this V chunk
-    vd_start = pid_v * BLOCK_D
-    acc_even = tl.zeros([HALF_D], dtype=tl.float32)
-    acc_odd = tl.zeros([HALF_D], dtype=tl.float32)
-
-    for tile_idx in range(num_tiles):
-        tile_start = tile_idx * BLOCK_KV
-        kv_offsets = tile_start + tl.arange(0, BLOCK_KV)
-        mask_kv = kv_offsets < kv_len
-        kv_idx = kv_start + kv_offsets
-
-        s = tl.load(score_base + kv_offsets, mask=mask_kv, other=float("-inf"))
-        p = tl.math.exp2((s - m_global) * log2e) / l_global
+        # ── Step 2: Online softmax update ──
+        m_new = tl.maximum(m_prev, tl.max(scores, axis=0))
+        alpha = tl.math.exp2((m_prev - m_new) * LOG2E)
+        p = tl.math.exp2((scores - m_new) * LOG2E)
         p = tl.where(mask_kv, p, 0.0)
 
+        acc_even = acc_even * alpha
+        acc_odd = acc_odd * alpha
+        l_prev = l_prev * alpha + tl.sum(p, axis=0)
+        m_prev = m_new
+
+        # ── Step 3: Accumulate V for this chunk ──
         v_lo, v_hi = _dequant_block(
             KV_fp4_ptr, KV_scale_ptr,
             kv_idx, mask_kv, vd_start,
             stride_kv_tok, stride_sc_tok,
             BLOCK_KV, BLOCK_D,
         )
-        # p: (BLOCK_KV,), v_lo: (BLOCK_KV, HALF_D) → weighted sum: (HALF_D,)
         acc_even += tl.sum(p[:, None] * v_lo, axis=0)
         acc_odd += tl.sum(p[:, None] * v_hi, axis=0)
 
-    # Store interleaved
-    o_base = O_ptr + pid_b * stride_o_tok + pid_h * stride_o_head
+    # ── Final normalization ──
+    acc_even = acc_even / l_prev
+    acc_odd = acc_odd / l_prev
+
+    # ── Store interleaved output ──
     even_offsets = vd_start + tl.arange(0, HALF_D) * 2
     odd_offsets = vd_start + tl.arange(0, HALF_D) * 2 + 1
     tl.store(o_base + even_offsets, acc_even.to(tl.bfloat16), mask=even_offsets < V_DIM)
@@ -213,40 +176,26 @@ def mla_value_kernel(
 
 def triton_mla_decode_mxfp4(q, kv_fp4, kv_scale, kv_indptr, config):
     batch_size = config["batch_size"]
-    kv_seq_len = config["kv_seq_len"]
 
     kv_fp4_2d = kv_fp4.squeeze(1) if kv_fp4.dim() == 3 else kv_fp4
     kv_fp4_2d = kv_fp4_2d.view(torch.uint8)
     kv_scale_u8 = kv_scale.view(torch.uint8) if kv_scale.dtype != torch.uint8 else kv_scale
 
-    BLOCK_KV = 64
-    BLOCK_D = 64
-
-    # Scratch buffer for scores
-    scores = torch.empty((batch_size, NUM_HEADS, kv_seq_len), dtype=torch.float32, device=q.device)
     o = torch.empty((batch_size, NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16, device=q.device)
 
-    # Pass 1: Compute scores
-    grid1 = (batch_size, NUM_HEADS)
-    mla_score_kernel[grid1](
-        q, kv_fp4_2d, kv_scale_u8, scores, kv_indptr,
+    BLOCK_KV = 64
+    BLOCK_D = 64
+    num_v_chunks = V_HEAD_DIM // BLOCK_D  # 8
+
+    grid = (batch_size, NUM_HEADS, num_v_chunks)
+    mla_decode_fused_kernel[grid](
+        q, kv_fp4_2d, kv_scale_u8, o, kv_indptr,
         q.stride(0), q.stride(1),
         kv_fp4_2d.stride(0), kv_scale_u8.stride(0),
-        scores.stride(0), scores.stride(1),
-        SM_SCALE, kv_seq_len,
-        BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D, QK_DIM=QK_HEAD_DIM,
-    )
-
-    # Pass 2: Softmax × V → output
-    num_v_chunks = V_HEAD_DIM // BLOCK_D
-    grid2 = (batch_size, NUM_HEADS, num_v_chunks)
-    mla_value_kernel[grid2](
-        kv_fp4_2d, kv_scale_u8, scores, o, kv_indptr,
-        kv_fp4_2d.stride(0), kv_scale_u8.stride(0),
-        scores.stride(0), scores.stride(1),
         o.stride(0), o.stride(1),
-        kv_seq_len,
-        BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D, V_DIM=V_HEAD_DIM,
+        SM_SCALE,
+        BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D,
+        QK_DIM=QK_HEAD_DIM, V_DIM=V_HEAD_DIM,
     )
     return o
 

@@ -27,9 +27,15 @@ a16w8 (bf16 Q + fp8 KV) is **always slower** than a8w8 (fp8 Q + fp8 KV) across a
 | Geomean | 0.456 ms | 0.451 ms |
 | Improvement | — | 1.2% |
 
-## MI355X Leaderboard (pending)
+## MI355X Leaderboard Results
 
-Submitted — awaiting results. Expected ~200 μs (minor improvement from v1.0).
+| Metric | Value |
+|---|---|
+| **Geomean** | **189.160 μs** |
+| Delta from v1.0 | +0.064 μs improvement |
+| Rank | ~65 (near dorhuri123 on board) |
+
+Improvement over v1.0 (~204 μs) = **~8% faster** from kv_splits tuning alone.
 
 ## MXFP4 Prototype Results (v2.2 two-pass, not submitted)
 
