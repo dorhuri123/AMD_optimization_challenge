@@ -1,15 +1,13 @@
 """
-Triton MLA decode with MXFP4 KV cache — v3.0 (single-pass, redundant softmax)
+Triton MLA decode with MXFP4 KV cache — v3.1 (single-pass + split-K)
 
-Each program handles one (batch, head, v_chunk). The QK scores are recomputed
-redundantly by all 8 V-chunk programs (V_DIM=512/BLOCK_D=64 = 8 chunks), but
-this eliminates the HBM score scratch buffer entirely.
+Two-stage flash-decoding:
+  Stage 1: Each program handles one (batch, head, kv_split, v_chunk).
+           Computes partial online-softmax output + log-sum-exp.
+  Stage 2: Reduce across kv_splits for each (batch, head, v_chunk).
 
-This is the same pattern used by sglang's production decode attention kernel.
-The 8x QK recomputation is cheap (compute-bound dot products) vs the HBM
-bandwidth saved by avoiding a (batch, heads, kv_seq_len) scratch buffer.
-
-Grid: (batch_size, NUM_HEADS, V_DIM // BLOCK_D)
+Grid stage 1: (batch * NUM_KV_SPLITS, NUM_HEADS, V_DIM // BLOCK_D)
+Grid stage 2: (batch, NUM_HEADS, V_DIM // BLOCK_D)
 """
 
 import torch
@@ -25,7 +23,6 @@ SM_SCALE = 1.0 / (QK_HEAD_DIM ** 0.5)
 
 @triton.jit
 def _e2m1_decode(nibble):
-    """Decode 4-bit E2M1 → float32."""
     sign = (nibble >> 3) & 1
     exp = (nibble >> 1) & 3
     mant = nibble & 1
@@ -46,7 +43,6 @@ def _dequant_block(
     BLOCK_KV: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Dequant (BLOCK_KV, BLOCK_D) tile → (lo, hi) each (BLOCK_KV, BLOCK_D//2)."""
     HALF_D: tl.constexpr = BLOCK_D // 2
     NUM_SCALES: tl.constexpr = BLOCK_D // 32
 
@@ -76,52 +72,62 @@ def _dequant_block(
 
 
 @triton.jit
-def mla_decode_fused_kernel(
-    Q_ptr, KV_fp4_ptr, KV_scale_ptr, O_ptr,
+def mla_stage1_kernel(
+    Q_ptr, KV_fp4_ptr, KV_scale_ptr,
+    Partial_O_ptr,    # (batch, NUM_KV_SPLITS, NUM_HEADS, num_v_chunks, BLOCK_D) f32
+    Partial_lse_ptr,  # (batch, NUM_KV_SPLITS, NUM_HEADS) f32  — shared across V chunks
     kv_indptr_ptr,
     stride_q_tok, stride_q_head,
     stride_kv_tok, stride_sc_tok,
-    stride_o_tok, stride_o_head,
+    stride_po_b, stride_po_s, stride_po_h, stride_po_v,
+    stride_lse_b, stride_lse_s, stride_lse_h,
     sm_scale,
     BLOCK_KV: tl.constexpr,
     BLOCK_D: tl.constexpr,
     QK_DIM: tl.constexpr,
     V_DIM: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
 ):
-    """Single-pass fused MLA decode with redundant QK scoring.
+    """Stage 1: partial attention for one KV split.
 
-    Grid: (batch, NUM_HEADS, V_DIM // BLOCK_D)
-    Each program: one V chunk, recomputes full QK scores independently.
+    Grid: (batch * NUM_KV_SPLITS, NUM_HEADS, V_DIM // BLOCK_D)
     """
     HALF_D: tl.constexpr = BLOCK_D // 2
     LOG2E: tl.constexpr = 1.4426950408889634
 
-    pid_b = tl.program_id(0)
+    pid_bs = tl.program_id(0)
     pid_h = tl.program_id(1)
     pid_v = tl.program_id(2)
+
+    pid_b = pid_bs // NUM_KV_SPLITS
+    pid_s = pid_bs % NUM_KV_SPLITS
 
     kv_start = tl.load(kv_indptr_ptr + pid_b)
     kv_end = tl.load(kv_indptr_ptr + pid_b + 1)
     kv_len = kv_end - kv_start
 
+    # This split's KV range
+    split_size = tl.cdiv(kv_len, NUM_KV_SPLITS)
+    split_kv_start = pid_s * split_size
+    split_kv_end = tl.minimum(split_kv_start + split_size, kv_len)
+    split_len = split_kv_end - split_kv_start
+
     q_base = Q_ptr + pid_b * stride_q_tok + pid_h * stride_q_head
-    o_base = O_ptr + pid_b * stride_o_tok + pid_h * stride_o_head
     vd_start = pid_v * BLOCK_D
 
-    # Online softmax state
     m_prev = tl.full([], float("-inf"), dtype=tl.float32)
     l_prev = tl.full([], 0.0, dtype=tl.float32)
     acc_even = tl.zeros([HALF_D], dtype=tl.float32)
     acc_odd = tl.zeros([HALF_D], dtype=tl.float32)
 
-    num_tiles = tl.cdiv(kv_len, BLOCK_KV)
+    num_tiles = tl.cdiv(split_len, BLOCK_KV)
     for tile_idx in range(num_tiles):
-        tile_start = tile_idx * BLOCK_KV
+        tile_start = split_kv_start + tile_idx * BLOCK_KV
         kv_offsets = tile_start + tl.arange(0, BLOCK_KV)
-        mask_kv = kv_offsets < kv_len
+        mask_kv = kv_offsets < split_kv_end
         kv_idx = kv_start + kv_offsets
 
-        # ── Step 1: Compute QK scores (redundant across V chunks) ──
+        # QK scores (redundant across V chunks)
         scores = tl.zeros([BLOCK_KV], dtype=tl.float32)
         for d_tile in tl.static_range(QK_DIM // BLOCK_D):
             d_start = d_tile * BLOCK_D
@@ -142,7 +148,7 @@ def mla_decode_fused_kernel(
         scores = scores * sm_scale
         scores = tl.where(mask_kv, scores, float("-inf"))
 
-        # ── Step 2: Online softmax update ──
+        # Online softmax
         m_new = tl.maximum(m_prev, tl.max(scores, axis=0))
         alpha = tl.math.exp2((m_prev - m_new) * LOG2E)
         p = tl.math.exp2((scores - m_new) * LOG2E)
@@ -153,7 +159,7 @@ def mla_decode_fused_kernel(
         l_prev = l_prev * alpha + tl.sum(p, axis=0)
         m_prev = m_new
 
-        # ── Step 3: Accumulate V for this chunk ──
+        # V accumulation
         v_lo, v_hi = _dequant_block(
             KV_fp4_ptr, KV_scale_ptr,
             kv_idx, mask_kv, vd_start,
@@ -163,11 +169,79 @@ def mla_decode_fused_kernel(
         acc_even += tl.sum(p[:, None] * v_lo, axis=0)
         acc_odd += tl.sum(p[:, None] * v_hi, axis=0)
 
-    # ── Final normalization ──
-    acc_even = acc_even / l_prev
-    acc_odd = acc_odd / l_prev
+    # Store partial output (interleaved even/odd)
+    po_base = (Partial_O_ptr
+               + pid_b * stride_po_b
+               + pid_s * stride_po_s
+               + pid_h * stride_po_h
+               + pid_v * stride_po_v)
+    even_offsets = tl.arange(0, HALF_D) * 2
+    odd_offsets = tl.arange(0, HALF_D) * 2 + 1
+    tl.store(po_base + even_offsets, acc_even)
+    tl.store(po_base + odd_offsets, acc_odd)
 
-    # ── Store interleaved output ──
+    # Store LSE (only from v_chunk 0 to avoid redundant writes)
+    if pid_v == 0:
+        # lse = m + log(l) in natural log
+        lse_val = m_prev + tl.log(l_prev + 1e-10)
+        lse_base = Partial_lse_ptr + pid_b * stride_lse_b + pid_s * stride_lse_s + pid_h * stride_lse_h
+        tl.store(lse_base, lse_val)
+
+
+@triton.jit
+def mla_reduce_kernel(
+    Partial_O_ptr, Partial_lse_ptr, O_ptr,
+    stride_po_b, stride_po_s, stride_po_h, stride_po_v,
+    stride_lse_b, stride_lse_s, stride_lse_h,
+    stride_o_tok, stride_o_head,
+    NUM_KV_SPLITS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    V_DIM: tl.constexpr,
+):
+    """Stage 2: Reduce partial outputs across KV splits.
+
+    Grid: (batch, NUM_HEADS, V_DIM // BLOCK_D)
+    """
+    HALF_D: tl.constexpr = BLOCK_D // 2
+
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_v = tl.program_id(2)
+    vd_start = pid_v * BLOCK_D
+
+    # Find global max LSE across splits
+    m_global = tl.full([], float("-inf"), dtype=tl.float32)
+    for s in tl.static_range(NUM_KV_SPLITS):
+        lse_s = tl.load(Partial_lse_ptr + pid_b * stride_lse_b + s * stride_lse_s + pid_h * stride_lse_h)
+        m_global = tl.maximum(m_global, lse_s)
+
+    # Weighted reduction
+    acc_even = tl.zeros([HALF_D], dtype=tl.float32)
+    acc_odd = tl.zeros([HALF_D], dtype=tl.float32)
+    l_global = tl.full([], 0.0, dtype=tl.float32)
+
+    for s in tl.static_range(NUM_KV_SPLITS):
+        lse_s = tl.load(Partial_lse_ptr + pid_b * stride_lse_b + s * stride_lse_s + pid_h * stride_lse_h)
+        weight = tl.math.exp(lse_s - m_global)
+        l_global += weight
+
+        po_base = (Partial_O_ptr
+                   + pid_b * stride_po_b
+                   + s * stride_po_s
+                   + pid_h * stride_po_h
+                   + pid_v * stride_po_v)
+        even_offsets = tl.arange(0, HALF_D) * 2
+        odd_offsets = tl.arange(0, HALF_D) * 2 + 1
+        p_even = tl.load(po_base + even_offsets)
+        p_odd = tl.load(po_base + odd_offsets)
+        acc_even += weight * p_even
+        acc_odd += weight * p_odd
+
+    acc_even = acc_even / l_global
+    acc_odd = acc_odd / l_global
+
+    # Store final output
+    o_base = O_ptr + pid_b * stride_o_tok + pid_h * stride_o_head
     even_offsets = vd_start + tl.arange(0, HALF_D) * 2
     odd_offsets = vd_start + tl.arange(0, HALF_D) * 2 + 1
     tl.store(o_base + even_offsets, acc_even.to(tl.bfloat16), mask=even_offsets < V_DIM)
@@ -176,26 +250,59 @@ def mla_decode_fused_kernel(
 
 def triton_mla_decode_mxfp4(q, kv_fp4, kv_scale, kv_indptr, config):
     batch_size = config["batch_size"]
+    kv_seq_len = config["kv_seq_len"]
 
     kv_fp4_2d = kv_fp4.squeeze(1) if kv_fp4.dim() == 3 else kv_fp4
     kv_fp4_2d = kv_fp4_2d.view(torch.uint8)
     kv_scale_u8 = kv_scale.view(torch.uint8) if kv_scale.dtype != torch.uint8 else kv_scale
 
-    o = torch.empty((batch_size, NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16, device=q.device)
-
     BLOCK_KV = 64
     BLOCK_D = 64
     num_v_chunks = V_HEAD_DIM // BLOCK_D  # 8
 
-    grid = (batch_size, NUM_HEADS, num_v_chunks)
-    mla_decode_fused_kernel[grid](
-        q, kv_fp4_2d, kv_scale_u8, o, kv_indptr,
+    # Choose NUM_KV_SPLITS based on sequence length
+    if kv_seq_len <= 1024:
+        NUM_KV_SPLITS = 4
+    elif kv_seq_len <= 4096:
+        NUM_KV_SPLITS = 8
+    else:
+        NUM_KV_SPLITS = 16
+
+    # Partial buffers
+    partial_o = torch.empty(
+        (batch_size, NUM_KV_SPLITS, NUM_HEADS, num_v_chunks, BLOCK_D),
+        dtype=torch.float32, device=q.device,
+    )
+    partial_lse = torch.empty(
+        (batch_size, NUM_KV_SPLITS, NUM_HEADS),
+        dtype=torch.float32, device=q.device,
+    )
+    o = torch.empty((batch_size, NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16, device=q.device)
+
+    # Stage 1
+    grid1 = (batch_size * NUM_KV_SPLITS, NUM_HEADS, num_v_chunks)
+    mla_stage1_kernel[grid1](
+        q, kv_fp4_2d, kv_scale_u8,
+        partial_o, partial_lse, kv_indptr,
         q.stride(0), q.stride(1),
         kv_fp4_2d.stride(0), kv_scale_u8.stride(0),
-        o.stride(0), o.stride(1),
+        partial_o.stride(0), partial_o.stride(1), partial_o.stride(2), partial_o.stride(3),
+        partial_lse.stride(0), partial_lse.stride(1), partial_lse.stride(2),
         SM_SCALE,
         BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D,
         QK_DIM=QK_HEAD_DIM, V_DIM=V_HEAD_DIM,
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
+    )
+
+    # Stage 2: reduce
+    grid2 = (batch_size, NUM_HEADS, num_v_chunks)
+    mla_reduce_kernel[grid2](
+        partial_o, partial_lse, o,
+        partial_o.stride(0), partial_o.stride(1), partial_o.stride(2), partial_o.stride(3),
+        partial_lse.stride(0), partial_lse.stride(1), partial_lse.stride(2),
+        o.stride(0), o.stride(1),
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
+        BLOCK_D=BLOCK_D, V_DIM=V_HEAD_DIM,
     )
     return o
 
