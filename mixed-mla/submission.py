@@ -1,42 +1,42 @@
 """
-Optimized MLA decode submission — v3.1 (Hybrid)
+Optimized MLA decode submission — v3.1 (Hybrid, single-file)
 
 Hybrid approach: bare Triton FP8 for small configs (eliminates AITER overhead),
 AITER cached a8w8 ASM kernel for large configs (hand-tuned ASM is faster).
 
 Per-config routing:
-  - bs=4, kv=1024: Triton FP8 (0.063ms vs ~0.2ms AITER)
+  - bs=4, kv=1024: Triton FP8 (0.063ms vs ~0.2ms AITER on MI300X)
   - All others: AITER cached a8w8
 """
 
 import torch
+import triton
+import triton.language as tl
 from task import input_t, output_t
 
-# --- Triton path (zero AITER overhead) ---
-from triton_fp8_decode import triton_mla_decode_fp8
-
-# --- AITER path (hand-tuned ASM) ---
 from aiter.mla import mla_decode_fwd
 from aiter import dtypes as aiter_dtypes
 from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
 
+# ─── MLA constants ───
 NUM_HEADS = 16
 NUM_KV_HEADS = 1
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
-QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM
-V_HEAD_DIM = KV_LORA_RANK
+QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # 576
+V_HEAD_DIM = KV_LORA_RANK  # 512
 SM_SCALE = 1.0 / (QK_HEAD_DIM ** 0.5)
 PAGE_SIZE = 1
 FP8_DTYPE = aiter_dtypes.fp8
 
-# Configs where bare Triton is faster than AITER
+# Configs routed to Triton (faster due to zero AITER overhead)
 TRITON_CONFIGS = {
-    (4, 1024),   # Triton 0.063ms vs AITER ~0.2ms
+    (4, 1024),
 }
 
-# AITER split-K tuning (for non-Triton configs)
-KV_SPLITS_MAP = {
+# AITER split-K tuning
+AITER_KV_SPLITS_MAP = {
+    (4, 1024): 16,
     (4, 8192): 32,
     (32, 1024): 16,
     (32, 8192): 48,
@@ -45,12 +45,251 @@ KV_SPLITS_MAP = {
     (256, 1024): 16,
     (256, 8192): 24,
 }
-DEFAULT_KV_SPLITS = 16
+DEFAULT_AITER_KV_SPLITS = 16
+
+# Triton split-K tuning
+TRITON_KV_SPLITS_MAP = {
+    (4, 1024): 4,
+}
 
 # Caches
 _meta_cache = {}
 _alloc_cache = {}
+_triton_buf_cache = {}
 
+
+# ═══════════════════════════════════════════════════════════
+# TRITON FP8 DECODE KERNEL (zero AITER overhead)
+# ═══════════════════════════════════════════════════════════
+
+@triton.jit
+def _mla_stage1_fp8(
+    Q_ptr, KV_ptr, kv_scale_ptr,
+    Partial_O_ptr, Partial_m_ptr, Partial_l_ptr,
+    kv_indptr_ptr,
+    stride_q_batch, stride_q_head, stride_kv_tok,
+    stride_po_b, stride_po_s, stride_po_h,
+    stride_ml_b, stride_ml_s, stride_ml_h,
+    sm_scale,
+    BLOCK_KV: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+):
+    """Stage 1: per (batch, split, head), accumulate all 512 V dims."""
+    LOG2E: tl.constexpr = 1.4426950408889634
+    QK_DIM: tl.constexpr = 576
+    V_DIM: tl.constexpr = 512
+
+    pid_bs = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    pid_b = pid_bs // NUM_KV_SPLITS
+    pid_s = pid_bs % NUM_KV_SPLITS
+
+    kv_start = tl.load(kv_indptr_ptr + pid_b)
+    kv_end = tl.load(kv_indptr_ptr + pid_b + 1)
+    kv_len = kv_end - kv_start
+
+    split_size = tl.cdiv(kv_len, NUM_KV_SPLITS)
+    split_kv_start = pid_s * split_size
+    split_kv_end = tl.minimum(split_kv_start + split_size, kv_len)
+
+    kv_scale = tl.load(kv_scale_ptr)
+    q_base = Q_ptr + pid_b * stride_q_batch + pid_h * stride_q_head
+
+    m_prev = tl.full([], float("-inf"), dtype=tl.float32)
+    l_prev = tl.full([], 0.0, dtype=tl.float32)
+
+    # 8 accumulators for V (512 dims / 64 = 8 chunks)
+    acc0 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    acc1 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    acc2 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    acc3 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    acc4 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    acc5 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    acc6 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    acc7 = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    num_tiles = tl.cdiv(split_kv_end - split_kv_start, BLOCK_KV)
+
+    for tile_idx in range(num_tiles):
+        tile_start = split_kv_start + tile_idx * BLOCK_KV
+        kv_offsets = tile_start + tl.arange(0, BLOCK_KV)
+        mask_kv = kv_offsets < split_kv_end
+        kv_idx = kv_start + kv_offsets
+
+        # --- Compute scores: Q[576] @ K[BLOCK_KV, 576]^T ---
+        scores = tl.zeros([BLOCK_KV], dtype=tl.float32)
+
+        for d_tile in tl.static_range(QK_DIM // BLOCK_D):  # 9 tiles
+            d_start = d_tile * BLOCK_D
+            d_offsets = d_start + tl.arange(0, BLOCK_D)
+            q_tile = tl.load(q_base + d_offsets).to(tl.float32)
+            k_tile = tl.load(
+                KV_ptr + kv_idx[:, None] * stride_kv_tok + d_offsets[None, :],
+                mask=mask_kv[:, None], other=0.0,
+            ).to(tl.float32)
+            scores += tl.sum(k_tile * q_tile[None, :], axis=1)
+
+        # FP8 dequant for K scores + attention scale
+        scores = scores * (kv_scale * sm_scale)
+        scores = tl.where(mask_kv, scores, float("-inf"))
+
+        # --- Online softmax ---
+        m_new = tl.maximum(m_prev, tl.max(scores, axis=0))
+        alpha = tl.math.exp2((m_prev - m_new) * LOG2E)
+        p = tl.math.exp2((scores - m_new) * LOG2E)
+        p = tl.where(mask_kv, p, 0.0)
+
+        acc0 *= alpha; acc1 *= alpha; acc2 *= alpha; acc3 *= alpha
+        acc4 *= alpha; acc5 *= alpha; acc6 *= alpha; acc7 *= alpha
+        l_prev = l_prev * alpha + tl.sum(p, axis=0)
+        m_prev = m_new
+
+        # --- Accumulate V: p @ V[BLOCK_KV, 512] (8 chunks of 64) ---
+        for v_blk in tl.static_range(V_DIM // BLOCK_D):
+            vd_start = v_blk * BLOCK_D
+            vd_offsets = vd_start + tl.arange(0, BLOCK_D)
+            v_tile = tl.load(
+                KV_ptr + kv_idx[:, None] * stride_kv_tok + vd_offsets[None, :],
+                mask=mask_kv[:, None], other=0.0,
+            ).to(tl.float32)
+            weighted = tl.sum(p[:, None] * v_tile, axis=0)
+
+            if v_blk == 0: acc0 += weighted
+            elif v_blk == 1: acc1 += weighted
+            elif v_blk == 2: acc2 += weighted
+            elif v_blk == 3: acc3 += weighted
+            elif v_blk == 4: acc4 += weighted
+            elif v_blk == 5: acc5 += weighted
+            elif v_blk == 6: acc6 += weighted
+            elif v_blk == 7: acc7 += weighted
+
+    # Apply kv_scale to V accumulators (deferred FP8 dequant)
+    acc0 *= kv_scale; acc1 *= kv_scale; acc2 *= kv_scale; acc3 *= kv_scale
+    acc4 *= kv_scale; acc5 *= kv_scale; acc6 *= kv_scale; acc7 *= kv_scale
+
+    # Store partial outputs
+    po_base = Partial_O_ptr + pid_b * stride_po_b + pid_s * stride_po_s + pid_h * stride_po_h
+    d_off = tl.arange(0, BLOCK_D)
+    tl.store(po_base + 0 * BLOCK_D + d_off, acc0)
+    tl.store(po_base + 1 * BLOCK_D + d_off, acc1)
+    tl.store(po_base + 2 * BLOCK_D + d_off, acc2)
+    tl.store(po_base + 3 * BLOCK_D + d_off, acc3)
+    tl.store(po_base + 4 * BLOCK_D + d_off, acc4)
+    tl.store(po_base + 5 * BLOCK_D + d_off, acc5)
+    tl.store(po_base + 6 * BLOCK_D + d_off, acc6)
+    tl.store(po_base + 7 * BLOCK_D + d_off, acc7)
+
+    ml_off = pid_b * stride_ml_b + pid_s * stride_ml_s + pid_h * stride_ml_h
+    tl.store(Partial_m_ptr + ml_off, m_prev)
+    tl.store(Partial_l_ptr + ml_off, l_prev)
+
+
+@triton.jit
+def _mla_reduce_fp8(
+    Partial_O_ptr, Partial_m_ptr, Partial_l_ptr, O_ptr,
+    stride_po_b, stride_po_s, stride_po_h,
+    stride_ml_b, stride_ml_s, stride_ml_h,
+    stride_o_batch, stride_o_head,
+    NUM_KV_SPLITS: tl.constexpr,
+    V_DIM: tl.constexpr,
+):
+    """Stage 2: Reduce across splits for one (batch, head)."""
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    m_global = tl.full([], float("-inf"), dtype=tl.float32)
+    for s in tl.static_range(NUM_KV_SPLITS):
+        m_s = tl.load(Partial_m_ptr + pid_b * stride_ml_b + s * stride_ml_s + pid_h * stride_ml_h)
+        m_global = tl.maximum(m_global, m_s)
+
+    l_global = tl.full([], 0.0, dtype=tl.float32)
+    acc = tl.zeros([V_DIM], dtype=tl.float32)
+    v_offsets = tl.arange(0, V_DIM)
+
+    for s in tl.static_range(NUM_KV_SPLITS):
+        m_s = tl.load(Partial_m_ptr + pid_b * stride_ml_b + s * stride_ml_s + pid_h * stride_ml_h)
+        l_s = tl.load(Partial_l_ptr + pid_b * stride_ml_b + s * stride_ml_s + pid_h * stride_ml_h)
+        rescale = tl.math.exp(m_s - m_global)
+        l_global += l_s * rescale
+
+        po_base = Partial_O_ptr + pid_b * stride_po_b + s * stride_po_s + pid_h * stride_po_h
+        partial = tl.load(po_base + v_offsets)
+        acc += rescale * partial
+
+    acc = acc / (l_global + 1e-10)
+    o_base = O_ptr + pid_b * stride_o_batch + pid_h * stride_o_head
+    tl.store(o_base + v_offsets, acc.to(tl.bfloat16))
+
+
+def _triton_get_buffers(batch_size, num_kv_splits, device):
+    key = (batch_size, num_kv_splits)
+    if key not in _triton_buf_cache:
+        _triton_buf_cache[key] = {
+            "partial_o": torch.empty(
+                (batch_size, num_kv_splits, NUM_HEADS, V_HEAD_DIM),
+                dtype=torch.float32, device=device,
+            ),
+            "partial_m": torch.empty(
+                (batch_size, num_kv_splits, NUM_HEADS),
+                dtype=torch.float32, device=device,
+            ),
+            "partial_l": torch.empty(
+                (batch_size, num_kv_splits, NUM_HEADS),
+                dtype=torch.float32, device=device,
+            ),
+            "output": torch.empty(
+                (batch_size, NUM_HEADS, V_HEAD_DIM),
+                dtype=torch.bfloat16, device=device,
+            ),
+        }
+    return _triton_buf_cache[key]
+
+
+def _triton_path(q, kv_data, kv_indptr, config):
+    """Bare Triton FP8 decode — zero AITER overhead."""
+    kv_fp8, kv_scale = kv_data["fp8"]
+    batch_size = config["batch_size"]
+    kv_seq_len = config["kv_seq_len"]
+
+    num_kv_splits = TRITON_KV_SPLITS_MAP.get((batch_size, kv_seq_len), 4)
+
+    kv_2d = kv_fp8.view(-1, QK_HEAD_DIM)
+    BLOCK_KV = 64
+    BLOCK_D = 64
+
+    bufs = _triton_get_buffers(batch_size, num_kv_splits, q.device)
+
+    grid1 = (batch_size * num_kv_splits, NUM_HEADS)
+    _mla_stage1_fp8[grid1](
+        q, kv_2d, kv_scale,
+        bufs["partial_o"], bufs["partial_m"], bufs["partial_l"],
+        kv_indptr,
+        q.stride(0), q.stride(1), kv_2d.stride(0),
+        bufs["partial_o"].stride(0), bufs["partial_o"].stride(1), bufs["partial_o"].stride(2),
+        bufs["partial_m"].stride(0), bufs["partial_m"].stride(1), bufs["partial_m"].stride(2),
+        SM_SCALE,
+        BLOCK_KV=BLOCK_KV, BLOCK_D=BLOCK_D,
+        NUM_KV_SPLITS=num_kv_splits,
+    )
+
+    grid2 = (batch_size, NUM_HEADS)
+    _mla_reduce_fp8[grid2](
+        bufs["partial_o"], bufs["partial_m"], bufs["partial_l"], bufs["output"],
+        bufs["partial_o"].stride(0), bufs["partial_o"].stride(1), bufs["partial_o"].stride(2),
+        bufs["partial_m"].stride(0), bufs["partial_m"].stride(1), bufs["partial_m"].stride(2),
+        bufs["output"].stride(0), bufs["output"].stride(1),
+        NUM_KV_SPLITS=num_kv_splits,
+        V_DIM=V_HEAD_DIM,
+    )
+
+    return bufs["output"]
+
+
+# ═══════════════════════════════════════════════════════════
+# AITER CACHED A8W8 PATH (hand-tuned ASM kernel)
+# ═══════════════════════════════════════════════════════════
 
 def quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     finfo = torch.finfo(FP8_DTYPE)
@@ -106,8 +345,7 @@ def _aiter_path(q, kv_data, qo_indptr, kv_indptr, config):
     """AITER cached a8w8 path."""
     bs = config["batch_size"]
     kvlen = config["kv_seq_len"]
-
-    num_kv_splits = KV_SPLITS_MAP.get((bs, kvlen), DEFAULT_KV_SPLITS)
+    num_kv_splits = AITER_KV_SPLITS_MAP.get((bs, kvlen), DEFAULT_AITER_KV_SPLITS)
 
     q_fp8, q_scale = quantize_fp8(q)
     kv_fp8, kv_scale = kv_data["fp8"]
@@ -117,7 +355,6 @@ def _aiter_path(q, kv_data, qo_indptr, kv_indptr, config):
         q_fp8.dtype, kv_fp8.dtype,
         qo_indptr, kv_indptr, num_kv_splits,
     )
-
     allocs = _get_cached_allocs(bs, NUM_HEADS, q.device)
     o = allocs["output"]
 
@@ -144,11 +381,9 @@ def _aiter_path(q, kv_data, qo_indptr, kv_indptr, config):
     return o
 
 
-def _triton_path(q, kv_data, kv_indptr, config):
-    """Bare Triton FP8 path — zero AITER overhead."""
-    kv_fp8, kv_scale = kv_data["fp8"]
-    return triton_mla_decode_fp8(q, kv_fp8, kv_scale, kv_indptr, config)
-
+# ═══════════════════════════════════════════════════════════
+# ENTRY POINT — routes to Triton or AITER per config
+# ═══════════════════════════════════════════════════════════
 
 def custom_kernel(data: input_t) -> output_t:
     q, kv_data, qo_indptr, kv_indptr, config = data
