@@ -22,6 +22,7 @@ from aiter.utility.fp4_utils import dynamic_mxfp4_quant
 NUM_HEADS: int = 16
 QK_HEAD_DIM: int = 576
 V_HEAD_DIM: int = 512
+SM_SCALE: float = 1.0 / (QK_HEAD_DIM ** 0.5)  # 1/sqrt(576) ≈ 0.04167
 
 # K dim tiles: 576 = 4 * 128 + 64 → 5 tiles of 128 (last padded)
 NUM_K_TILES: int = 5  # ceil(576 / 128)
@@ -65,6 +66,7 @@ def _mla_mxfp4_stage1(
     stride_v_tok,     # stride per V token (576 for bf16)
     stride_po_b, stride_po_s, stride_po_h,
     stride_ml_b, stride_ml_s, stride_ml_h,
+    sm_scale,
     BLOCK_N: tl.constexpr,       # KV tokens per tile
     V_CHUNK_D: tl.constexpr,     # V dims per chunk
     NUM_KV_SPLITS: tl.constexpr,
@@ -165,7 +167,8 @@ def _mla_mxfp4_stage1(
                 fast_math=True, acc=qk,
             )
 
-        # Apply masking for out-of-bounds KV tokens
+        # Apply attention scaling and masking
+        qk *= sm_scale
         qk = tl.where(mask_kv[None, :], qk, float("-inf"))
 
         # --- Online softmax ---
@@ -314,6 +317,7 @@ def triton_mla_decode_mxfp4(q, kv_fp4, kv_scale, kv_bf16, kv_indptr, config):
         v_bf16_2d.stride(0),
         bufs["partial_o"].stride(0), bufs["partial_o"].stride(1), bufs["partial_o"].stride(2),
         bufs["partial_m"].stride(0), bufs["partial_m"].stride(1), bufs["partial_m"].stride(2),
+        SM_SCALE,
         BLOCK_N=BLOCK_N, V_CHUNK_D=V_CHUNK_D,
         NUM_KV_SPLITS=num_kv_splits,
         NUM_HEADS=NUM_HEADS,
