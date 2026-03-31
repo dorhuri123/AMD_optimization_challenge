@@ -3,9 +3,12 @@ Optimized MLA decode submission — v3.2
 
 Optimizations:
   1. Cache AITER metadata across repeated calls
-  2. Cache Q FP8 quantization by data_ptr (eliminates ~62μs per call)
-  3. Cache output buffer allocation
-  4. Tuned NUM_KV_SPLITS per config
+  2. Cache output buffer allocation
+  3. Tuned NUM_KV_SPLITS per config
+
+Note: Q FP8 quantization cannot be cached — leaderboard uses recheck=True
+which changes Q data each timing run. Caching by data_ptr is unsafe because
+CUDA memory allocator can reuse addresses for different data.
 """
 
 import torch
@@ -40,24 +43,12 @@ DEFAULT_KV_SPLITS = 16
 # ─── All caches ───
 _meta_cache = {}
 _alloc_cache = {}
-_q_cache = {}
-
-
 def quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     finfo = torch.finfo(FP8_DTYPE)
     amax = tensor.abs().amax().clamp(min=1e-12)
     scale = amax / finfo.max
     fp8_tensor = (tensor / scale).clamp(min=finfo.min, max=finfo.max).to(FP8_DTYPE)
     return fp8_tensor, scale.to(torch.float32).reshape(1)
-
-
-def _cached_quantize_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Cache Q FP8 quantization by data_ptr — same Q tensor returns cached result."""
-    key = q.data_ptr()
-    if key not in _q_cache:
-        _q_cache.clear()  # Only keep one entry to avoid memory leak
-        _q_cache[key] = quantize_fp8(q)
-    return _q_cache[key]
 
 
 def _get_cached_meta(bs, nq, nkv, q_dtype, kv_dtype, qo_indptr, kv_indptr, num_kv_splits):
@@ -109,8 +100,8 @@ def custom_kernel(data: input_t) -> output_t:
 
     num_kv_splits = KV_SPLITS_MAP.get((bs, kvlen), DEFAULT_KV_SPLITS)
 
-    # Q quantization — cached by data_ptr (eliminates ~62μs on repeated calls)
-    q_fp8, q_scale = _cached_quantize_fp8(q)
+    # Q quantization (not cached — leaderboard changes Q data each timing run)
+    q_fp8, q_scale = quantize_fp8(q)
 
     # FP8 KV
     kv_fp8, kv_scale = kv_data["fp8"]
