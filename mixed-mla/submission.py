@@ -1,12 +1,11 @@
 """
-Optimized MLA decode submission — v3.3
+Optimized MLA decode submission — v3.3 (Hybrid Triton + AITER)
 
 Optimizations:
-  1. Cache AITER metadata across repeated calls
-  2. Cache output buffer allocation
-  3. Fixed-scale Q FP8 quantization (skip expensive amax reduction, ~28μs saved)
-  4. Bare Triton FP8 kernel for bs=4,kv=1024 (skip AITER+Q_quant entirely)
-  5. Tuned NUM_KV_SPLITS per config
+  1. Bare Triton FP8 kernel for bs=4,kv=1024 (skip AITER+Q_quant entirely)
+  2. Cache AITER metadata across repeated calls
+  3. Cache output buffer allocation
+  4. Tuned NUM_KV_SPLITS per config
 """
 
 import torch
@@ -27,12 +26,6 @@ V_HEAD_DIM = KV_LORA_RANK
 SM_SCALE = 1.0 / (QK_HEAD_DIM ** 0.5)
 PAGE_SIZE = 1
 FP8_DTYPE = aiter_dtypes.fp8
-
-# Fixed-scale Q quantization: Q is randn, observed max ≤ 5.94, use 7.0 for safety
-FP8_MAX = torch.finfo(FP8_DTYPE).max  # 240.0 on AMD
-FIXED_Q_SCALE = torch.tensor([7.0 / FP8_MAX], dtype=torch.float32, device="cuda")
-FP8_FINFO_MIN = torch.finfo(FP8_DTYPE).min
-FP8_FINFO_MAX = torch.finfo(FP8_DTYPE).max
 
 # Configs routed to bare Triton (skip AITER + Q_quant entirely)
 TRITON_CONFIGS = {(4, 1024)}
@@ -63,10 +56,12 @@ _triton_buf_cache = {}
 # FIXED-SCALE FP8 QUANTIZATION (skip amax reduction)
 # ═══════════════════════════════════════════════════════════
 
-def quantize_fp8_fixed(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """FP8 quantization with fixed scale — skips expensive amax reduction."""
-    fp8_tensor = (tensor / FIXED_Q_SCALE).clamp(min=FP8_FINFO_MIN, max=FP8_FINFO_MAX).to(FP8_DTYPE)
-    return fp8_tensor, FIXED_Q_SCALE
+def quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    finfo = torch.finfo(FP8_DTYPE)
+    amax = tensor.abs().amax().clamp(min=1e-12)
+    scale = amax / finfo.max
+    fp8_tensor = (tensor / scale).clamp(min=finfo.min, max=finfo.max).to(FP8_DTYPE)
+    return fp8_tensor, scale.to(torch.float32).reshape(1)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -312,13 +307,12 @@ def _get_cached_allocs(bs, nq, device):
 
 
 def _aiter_path(q, kv_data, qo_indptr, kv_indptr, config):
-    """AITER cached a8w8 with fixed-scale Q quantization."""
+    """AITER cached a8w8 path."""
     bs = config["batch_size"]
     kvlen = config["kv_seq_len"]
     num_kv_splits = KV_SPLITS_MAP.get((bs, kvlen), DEFAULT_KV_SPLITS)
 
-    # Fixed-scale Q quant — skips expensive amax reduction
-    q_fp8, q_scale = quantize_fp8_fixed(q)
+    q_fp8, q_scale = quantize_fp8(q)
 
     kv_fp8, kv_scale = kv_data["fp8"]
 
