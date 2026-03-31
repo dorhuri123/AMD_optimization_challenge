@@ -1,36 +1,37 @@
 # Mixed-MLA Session Handoff — Continue From Here
 
-## Current State (2026-03-31)
+## Current State (2026-03-31, afternoon)
 
 ### Leaderboard Position
-- **v2.0 geomean: 92.534 μs** on MI355X (was 189 μs baseline)
-- **~2x improvement** from caching AITER metadata
+- **v2.0 geomean: 92.534 μs** on MI355X (current best on leaderboard)
+- **v3.3 ready to submit**: Hybrid Triton+AITER, estimated ~85 μs
 - Top 1 is 12.7 μs — we need another ~7x to compete for top spots
 - Leaderboard username: `dorhuri123`
 
-### What's Deployed
-- `submission.py` = v2.1 (metadata cache + output buffer reuse)
-- Repo is **PRIVATE** — need PAT to clone on GPU machines
+### What's Ready to Submit
+- `submission.py` = v3.3 (Hybrid: Triton for bs=4,kv=1024 + AITER cached for rest)
+- **Passed all 4 MI355X tests** (validated via popcorn test mode)
+- **NOT yet scored on leaderboard** (was rate limited — submit ASAP)
 
 ### Version History
 
-| Version | Geomean (MI355X) | Key Change |
-|---|---|---|
-| v1.0 | ~204 μs | Baseline (reference clone) |
-| v1.1 | ~189 μs | Tuned kv_splits per config |
-| v2.0 | **92.534 μs** | Cache AITER metadata (~50% of time was metadata setup!) |
+| Version | Geomean (MI355X) | Key Change | Submitted? |
+|---|---|---|---|
+| v1.0 | ~204 μs | Baseline reference clone | Yes |
+| v1.1 | ~189 μs | Tuned kv_splits per config | Yes |
+| v2.0 | **92.534 μs** | Cache AITER metadata (~2x) | **Yes (current best)** |
+| v3.3 | ~85 μs (est.) | Hybrid Triton+AITER | **Ready, not submitted** |
 
 ### Files Layout
 ```
 mixed-mla/
-  submission.py          ← current v2.1 (what gets submitted)
-  triton_mla_mxfp4.py   ← MXFP4 Triton kernel v3.2 (correct but slow on MI300X)
-  reference.py           ← official reference (copied from gpu-mode/reference-kernels)
+  submission.py          ← v3.3 hybrid (ready to submit)
+  triton_fp8_decode.py   ← standalone Triton FP8 kernel (also inlined in submission.py)
+  triton_mla_mxfp4.py    ← MXFP4 Triton kernel v3.2 (correct but slow, manual dequant)
+  triton_mxfp4_dotscaled.py ← WIP tl.dot_scaled MXFP4 kernel (placeholder)
+  reference.py           ← official reference
   task.py, task.yml      ← official task spec
   benchmark.py           ← local ref vs submission benchmark
-  scripts/sweep_kv_splits.py
-  DEEP_DIVE.md           ← educational doc on MLA, quantization, GPU concepts
-  SESSION_HANDOFF.md     ← this file
   versions/              ← archived submissions with results
 ```
 
@@ -89,156 +90,116 @@ popcorn-cli submit --gpu MI355X --leaderboard amd-mixed-mla --mode leaderboard -
 - **RunPod MI300X is BROKEN** — SR-IOV virtualization causes hipInit() hang. Don't use.
 - **Hot Aisle host ROCm is 7.2** — must use `torch +rocm7.2`
 - **First AITER run** takes ~5 min for JIT compilation. Cached in `~/aiter/aiter/jit/build/`
-- **If changing PyTorch version**: `find ~/aiter -name "*.so" -delete && rm -rf ~/aiter/aiter/jit/build`
+- **Rate limits**: 1 leaderboard submission/hour, 4 test submissions/hour
 
 ---
 
 ## Key Profiling Results
 
-### AITER Overhead Breakdown (MI300X)
+### MI300X Performance (v3.3 hybrid)
 ```
-bs=4, kv=1024:   metadata=0.414ms (98%), Q_quant=0.062ms, kernel=~0ms
-bs=32, kv=8192:  metadata=0.052ms (12%), Q_quant=0.063ms, kernel=0.319ms (73%)
-bs=256, kv=8192: metadata=0.053ms (7%),  Q_quant=0.067ms, kernel=0.677ms (85%)
+Config         | Reference | v3.3 Sub | Speedup
+bs=4, kv=1024  | 0.408ms   | 0.063ms  | 6.48x  (Triton path)
+bs=4, kv=8192  | 0.406ms   | 0.282ms  | 1.44x  (AITER cached)
+bs=32, kv=1024 | 0.410ms   | 0.272ms  | 1.51x
+bs=32, kv=8192 | 0.413ms   | 0.274ms  | 1.51x
+bs=64, kv=1024 | 0.387ms   | 0.262ms  | 1.47x
+bs=64, kv=8192 | 0.468ms   | 0.273ms  | 1.71x
+bs=256, kv=1024| 0.490ms   | 0.270ms  | 1.81x
+bs=256, kv=8192| 0.817ms   | 0.544ms  | 1.50x
+geomean        | 0.461ms   | 0.247ms  | 1.86x
 ```
-→ Small configs: metadata-dominated (fixed by v2.0 caching)
-→ Large configs: kernel-dominated (need faster kernel)
 
-### With Metadata Cached (MI300X)
+### MI355X v2.0 per-config (leaderboard confirmed)
 ```
-bs=4, kv=1024:   0.205ms (was 0.418ms → 51% savings)
-bs=256, kv=8192: 0.470ms (was 0.801ms → 41% savings)
+bs=4, kv=1024:   49.7 μs
+bs=4, kv=8192:   58.1 μs
+bs=32, kv=1024:  55.7 μs
+bs=32, kv=8192:  105 μs
+bs=64, kv=1024:  64.3 μs
+bs=64, kv=8192:  154 μs
+bs=256, kv=1024: 107 μs
+bs=256, kv=8192: 302 μs
+geomean: 92.534 μs
 ```
-
-### MXFP4 Triton Kernel (v3.2, MI300X — correct but slow)
-```
-bs=4, kv=1024:   0.254ms → 1.69x faster than ref (WINS on small config)
-bs=256, kv=8192: 124.9ms → way too slow (8x redundant QK computation)
-```
-→ Triton can't do 2D accumulator indexing, forcing redundant QK per V-chunk
-→ On MI355X with tl.dot_scaled hardware, this may be different
-
-### a16w8 vs a8w8
-a16w8 (bf16 Q + fp8 KV) is **always slower**. Eliminated.
 
 ---
 
-## Optimization Paths — Priority Order for Top 10
+## Critical Findings This Session
 
-### Path A: Bare Triton FP8 Decode — Skip AITER Entirely (MEDIUM effort, BIG potential)
-Write a simple Triton decode kernel: load FP8 KV, dequant in registers, dot product, online softmax.
-No AITER metadata, no persistent mode overhead, no work buffers.
-For small configs the kernel is ~0ms but AITER overhead is ~0.05ms even cached.
-- **Expected: 30-50 μs on small configs → big geomean improvement**
-- **Why**: eliminates all framework overhead, direct grid launch
+### 1. Q FP8 Caching by data_ptr is UNSAFE
+The leaderboard eval uses `recheck=True` which changes the seed and regenerates data each timing run. CUDA memory allocator can reuse addresses for different data, causing stale cache hits → wrong results. **Do NOT cache Q by data_ptr.**
 
-### Path B: tl.dot_scaled MXFP4 Kernel for MI355X (HIGH effort, HIGHEST potential)
-MI355X (gfx950) has hardware `tl.dot_scaled` for MXFP4 — 2x throughput of FP8.
-AITER's `fav3_sage_attention_mxfp4.py` is the template (prefill kernel using dot_scaled).
-Batch 16 Q heads as M=16 → fills 16×16×128 MFMA tile perfectly.
-Can't test on MI300X (no gfx950), must submit via popcorn to test.
-- **Expected: 20-40 μs (top 5-10 range)**
-- **Risk**: can't debug locally, submit-only iteration
+### 2. Fixed-scale Q Quantization is UNSAFE
+Using a fixed amax (e.g., 7.0) instead of dynamic per-tensor amax causes max_diff up to 2.83 on some seeds. The AITER ASM kernel is sensitive to Q quantization precision. **Always use dynamic per-tensor quantization.**
 
-### Path C: CK (Composable Kernel) Based Decode (MEDIUM effort, GOOD potential)
-CK is AMD's C++ template library for GPU kernels. Not raw assembly — you compose
-pre-built tile operators. CK already has MLA decode templates in:
-`composable_kernel/include/ck_tile/ops/mla/`
-Steps:
-1. Clone CK: `git clone https://github.com/ROCm/composable_kernel`
-2. Study `example/ck_tile/` for MLA examples
-3. Write a CK-based decode kernel with MXFP4 KV support
-4. Compile with hipcc, wrap in Python via ctypes or pybind11
+### 3. Triton vs AITER per-config (MI300X)
+Triton only wins on bs=4,kv=1024 (4.4x). ALL other configs: AITER ASM wins by 1.5-44x. The AITER kernel is unbeatable for large configs.
+
+### 4. tl.dot_scaled API (from AITER fav3_sage_attention_mxfp4.py)
+```python
+# QK scores via hardware MXFP4:
+scores = tl.dot_scaled(q_fp4, q_scale, "e2m1", k_fp4, k_scale, "e2m1", fast_math=True)
+# K loaded TRANSPOSED: [D/2, BLOCK_N]
+# Q/K scales: [rows, D//32] E8M0
+# V uses regular tl.dot (not dot_scaled), V_Descale applied at end
+```
+
+### 5. Leaderboard Eval Methodology
+- `recheck=True` on leaderboard: seed changes each timing run, Q/KV data regenerated
+- L2 cache cleared between runs via `clear_l2_cache()`
+- Stats: mean, std, min, max, err across runs
+- This means NO caching optimizations work on the leaderboard (Q changes every run)
+
+---
+
+## Optimization Paths — Updated Priority for Top 10
+
+### Path A: Submit v3.3 NOW (IMMEDIATE)
+Just submit v3.3 as-is. Expected ~85 μs (est. from Triton savings on bs=4,kv=1024).
+
+### Path B: tl.dot_scaled MXFP4 Kernel (HIGH priority, HIGH potential)
+MI355X has hardware MXFP4 dot product — 2x throughput of FP8.
+- Use `kv_data["mxfp4"]` directly (no conversion needed)
+- Q needs MXFP4 quantization (~46μs via dynamic_mxfp4_quant)
+- BLOCK_M=16 (query heads → perfect 16×16 MFMA tile)
+- Must pad QK_DIM from 576 to 1024 (next power of 2)
+- Can only test via MI355X submit (no gfx950 locally)
+- **Expected: 40-60 μs if kernel is well-written**
+
+### Path C: CK-Based Decode (MEDIUM priority)
+Composable Kernel C++ templates. CK already has MLA decode templates.
+- Clone: `git clone https://github.com/ROCm/composable_kernel`
+- Study `include/ck_tile/ops/mla/` for decode examples
+- Compile with hipcc, wrap via pybind11
 - **Expected: 30-50 μs**
-- **Pro**: CK generates near-ASM quality code, works on MI300X for testing
-- **Con**: C++ development, longer iteration cycle
 
-### Path D: ASM-Level Optimization (HIGH effort, HIGHEST ceiling)
-AITER's core MLA kernel is hand-tuned assembly (`mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co`).
-The `.co` files are in `~/aiter/hsa/gfx942/mla/` (MI300X) and `~/aiter/hsa/gfx950/mla/` (MI355X).
-AITER's `hsa/codegen.py` generates ASM from CSV config tables.
-Options:
-1. Modify the ASM codegen configs to add MXFP4 KV support
-2. Disassemble the existing `.co`, modify tile sizes / add dequant instructions
-3. Write new ASM using AMD's ISA docs
-- **Expected: 15-30 μs (top 3 range)**
-- **Pro**: maximum performance, exactly what top entries use
-- **Con**: extremely difficult, ISA-level debugging
+### Path D: ASM-Level (LOW priority, HIGHEST ceiling)
+AITER's `.co` files are hand-tuned assembly. Modifying them could yield best results.
+- Files: `~/aiter/hsa/gfx950/mla/mla_a8w8_*.co`
+- Codegen: `~/aiter/hsa/codegen.py`
+- **Expected: 15-30 μs (top 3)**
 
-### Path E: Hybrid Submission (LOW effort, uses all above)
-Different kernel per config:
-- bs≤32: bare Triton (skip AITER overhead entirely)
-- bs=64+, kv≤1024: AITER cached a8w8
-- bs=64+, kv=8192: AITER cached a8w8 or CK/MXFP4
-- **Expected: best of all approaches per config**
-
----
-
-## Research Completed
-
-1. **MXFP4 format**: E2M1 + E8M0, fp4x2 packing, dequant verified correct
-2. **AITER internals**: persistent ASM kernel, split-K, online softmax, metadata overhead
-3. **Triton limitations**: no 2D indexing, no slice assignment, no fp4 type
-4. **tl.dot_scaled**: gfx950 only, e2m1 format, 16×16×128 tiles, 2x FP8 throughput
-5. **Leaderboard top entries**: likely custom kernel + MXFP4 + zero overhead
-6. **RunPod**: broken (SR-IOV), use Hot Aisle instead
-7. **AITER has NO MXFP4 decode path** — only bf16/fp8 in mla_decode_fwd
+### Path E: Per-Config Routing (ONGOING)
+Route each config to the fastest kernel. Current routing:
+- bs=4, kv=1024 → Triton FP8 (zero overhead)
+- Everything else → AITER a8w8 cached
 
 ---
 
 ## Prompt to Start Next Session
 
-Copy-paste this into a new Claude Code chat (replace `<PUT_IP_HERE>` with Hot Aisle VM IP):
-
 ```
 I'm continuing work on the AMD x GPU MODE mixed-MLA decode optimization challenge.
 
-Current state: v2.0 at 92.534 μs geomean on MI355X. Top 1 is 12.7 μs (~7x gap).
+Current state: v3.3 at estimated ~85 μs (v2.0 was 92.534 μs). Top 1 is 12.7 μs.
 Repo: github.com/dorhuri123/AMD_optimization_challenge (PRIVATE, branch: mixed-mla-dev)
 Deadline: April 6, 2026.
 
-Read mixed-mla/SESSION_HANDOFF.md FIRST — it has the full context, GPU setup, profiling data, and 5 ranked optimization paths.
+FIRST: Submit v3.3 for leaderboard scoring:
+  cd mixed-mla && popcorn-cli submit --gpu MI355X --leaderboard amd-mixed-mla --mode leaderboard --no-tui submission.py
 
-Hot Aisle MI300X SSH: ssh hotaisle@<PUT_IP_HERE> -i ~/.ssh/id_ed25519
-Popcorn submit (local, no GPU needed): popcorn-cli submit --gpu MI355X --leaderboard amd-mixed-mla --mode leaderboard --no-tui submission.py
+Read mixed-mla/SESSION_HANDOFF.md for full context, then work on Path B (tl.dot_scaled MXFP4 kernel).
 
-Work in parallel using Agent teams:
-
-Agent 1 "research": Read SESSION_HANDOFF.md, then deep-dive into AITER source code (aiter/mla.py, aiter/ops/triton/_triton_kernels/attention/), CK MLA templates (composable_kernel/include/ck_tile/ops/mla/), and gfx950 ISA docs. Find concrete code patterns we can adapt. Focus on: how does fav3_sage_attention_mxfp4.py use tl.dot_scaled? Can we adapt CK's MLA decode for MXFP4 KV? What ASM instructions does the reference .co kernel use?
-
-Agent 2 "kernel-dev": Implement the highest-priority optimization path. Start with Path A (bare Triton FP8 decode kernel that skips AITER entirely — no metadata, no persistent mode, just direct grid launch). Then move to Path B (tl.dot_scaled MXFP4 for MI355X). Write the kernel, test on MI300X via SSH, iterate until correct and fast.
-
-Agent 3 "benchmark-submit": After kernel-dev produces a working version, run benchmark.py on the GPU, verify correctness, then submit via popcorn-cli. Record results in versions/ folder. Compare per-config latencies to find which configs improved and which need more work.
-
-All agents should coordinate — research findings feed into kernel-dev, kernel-dev outputs feed into benchmark-submit.
+Hot Aisle MI300X SSH: ssh hotaisle@<IP> -i ~/.ssh/id_ed25519
 ```
-
----
-
-## Agent Teams
-
-Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in `~/.claude/settings.json` (already set).
-No config files needed — teams are spawned dynamically from the prompt above.
-
-### How It Works
-
-Claude reads the prompt, then launches 3 sub-agents in parallel using the Agent tool:
-
-1. **"research"** — reads code, fetches URLs, searches for patterns. Does NOT edit files.
-   - Reads AITER source: `aiter/mla.py`, attention kernels, codegen scripts
-   - Fetches CK MLA templates from GitHub
-   - Searches for gfx950 MFMA instruction docs
-   - Returns findings to the main agent for kernel-dev to use
-
-2. **"kernel-dev"** — writes and tests kernel code on the GPU via SSH.
-   - Implements Path A (bare Triton FP8) and Path B (tl.dot_scaled MXFP4)
-   - Pushes to repo, pulls on GPU, runs tests
-   - Iterates on correctness and performance
-
-3. **"benchmark-submit"** — runs after kernel-dev, handles submission pipeline.
-   - Runs `benchmark.py` on Hot Aisle MI300X
-   - Submits via `popcorn-cli` locally
-   - Saves results to `versions/` folder
-   - Reports per-config breakdown
-
-The main agent coordinates: passes research findings to kernel-dev, triggers benchmark-submit when a version is ready, decides which optimization path to pursue next based on results.
