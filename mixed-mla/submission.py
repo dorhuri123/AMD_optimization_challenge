@@ -1,15 +1,14 @@
 """
-Optimized MLA decode submission -- v5.0 Hybrid (MXFP4 + AITER)
+Optimized MLA decode submission -- v7.0 MXFP4 V-Dequant + AITER
 
-Routes small configs to MXFP4 Triton kernel (dot_scaled on MI355X/gfx950)
-and large configs to AITER cached a8w8 path.
+Critical fix: V is now dequantized from MXFP4 packed data instead of loaded
+from bf16. This reduces V bandwidth from 1024 bytes/token (bf16) to ~270
+bytes/token (fp4x2 + scales), a 3.8x reduction.
 
-Routing:
-  MXFP4: (4,1024), (4,8192), (32,1024), (64,1024)
-  AITER: (32,8192), (64,8192), (256,1024), (256,8192)
-
-MXFP4 path: Q quantized to MXFP4, dot_scaled for QK, bf16 V via tl.dot
+MXFP4 path: Q quantized to MXFP4, dot_scaled for QK, V dequanted from fp4x2
 AITER path: Q quantized to FP8, cached metadata, mla_decode_fwd
+
+Routes ALL configs to MXFP4 initially to test V-dequant bandwidth savings.
 """
 
 import torch
@@ -40,9 +39,17 @@ FP8_DTYPE = aiter_dtypes.fp8
 PACKED_QK: int = 288       # 576 / 2 packed bytes
 NUM_SCALES: int = 18       # 576 / 32 scale blocks
 
-# Routing: which configs use MXFP4 vs AITER
-MXFP4_CONFIGS = {(4, 1024), (4, 8192), (32, 1024), (64, 1024)}
-# Everything else goes to AITER: (32,8192), (64,8192), (256,1024), (256,8192)
+# V dim layout within MXFP4 buffer:
+# V = first 512 dims = first 256 packed bytes
+# V scales = first 16 of 18 scale blocks (512/32 = 16)
+PACKED_V: int = 256        # 512 / 2 packed bytes
+NUM_V_SCALES: int = 16     # 512 / 32 scale blocks
+
+# Route ALL configs to MXFP4 to test V-dequant bandwidth savings
+MXFP4_CONFIGS = {
+    (4, 1024), (4, 8192), (32, 1024), (64, 1024),
+    (32, 8192), (64, 8192), (256, 1024), (256, 8192),
+}
 
 # MXFP4 split-K tuning
 MXFP4_KV_SPLITS_MAP = {
@@ -50,10 +57,14 @@ MXFP4_KV_SPLITS_MAP = {
     (4, 8192): 16,
     (32, 1024): 4,
     (64, 1024): 4,
+    (32, 8192): 16,
+    (64, 8192): 16,
+    (256, 1024): 4,
+    (256, 8192): 16,
 }
 MXFP4_DEFAULT_KV_SPLITS = 8
 
-# AITER split-K tuning
+# AITER split-K tuning (fallback)
 AITER_KV_SPLITS_MAP = {
     (32, 8192): 48,
     (64, 8192): 24,
@@ -69,16 +80,51 @@ _alloc_cache: dict = {}
 
 
 # ===============================================================
-# MXFP4 TRITON KERNEL -- STAGE 1
+# E2M1 DEQUANT HELPER (used inside Triton kernel)
+# ===============================================================
+# Each nibble: sign(1) | exp(2) | mant(1)
+# exp=0: denorm, val = sign * 0.5 * mant  (so 0 or 0.5)
+# exp=1-3: normal, val = sign * 2^(exp-1) * (1 + 0.5*mant)
+# E8M0 scale: exp2(scale_uint8 - 127.0)
+
+
+@triton.jit
+def _e2m1_dequant(nibbles):
+    """
+    Dequantize a tensor of uint8 nibble values (0-15) to float32.
+    Each nibble encodes: sign(1) | exp(2) | mant(1) in E2M1 format.
+    """
+    nibbles_i32 = nibbles.to(tl.int32)
+
+    sign_bit = (nibbles_i32 >> 3) & 1       # bit 3
+    exp_bits = (nibbles_i32 >> 1) & 0x3      # bits 2:1
+    mant_bit = nibbles_i32 & 1               # bit 0
+
+    sign_f = tl.where(sign_bit == 1, -1.0, 1.0)
+    mant_f = mant_bit.to(tl.float32)
+    exp_f = exp_bits.to(tl.float32)
+
+    # Denorm case (exp=0): val = 0.5 * mant (so 0.0 or 0.5)
+    denorm_val = 0.5 * mant_f
+
+    # Normal case (exp=1,2,3): val = 2^(exp-1) * (1 + 0.5*mant)
+    # exp=1 -> 1.0*(1+0.5m), exp=2 -> 2.0*(1+0.5m), exp=3 -> 4.0*(1+0.5m)
+    normal_val = tl.math.exp2(exp_f - 1.0) * (1.0 + 0.5 * mant_f)
+
+    val = tl.where(exp_bits == 0, denorm_val, normal_val)
+    return sign_f * val
+
+
+# ===============================================================
+# MXFP4 TRITON KERNEL -- STAGE 1 (V from MXFP4)
 # ===============================================================
 
 @triton.jit
 def _mla_mxfp4_stage1(
     Q_packed_ptr,     # [batch*16, 288] uint8 (packed e2m1)
     Q_scale_ptr,      # [batch*16, 18] uint8 (e8m0 scales)
-    K_packed_ptr,     # [total_kv, 288] uint8 (packed e2m1)
-    K_scale_ptr,      # [total_kv, 18] uint8 (e8m0 scales)
-    V_bf16_ptr,       # [total_kv, 576] bf16 (first 512 dims used)
+    K_packed_ptr,     # [total_kv, 288] uint8 (packed e2m1) — K AND V
+    K_scale_ptr,      # [total_kv, 18] uint8 (e8m0 scales) — K AND V scales
     Partial_O_ptr,    # [batch, splits, 16, V_DIM] f32
     Partial_m_ptr,    # [batch, splits, 16] f32
     Partial_l_ptr,    # [batch, splits, 16] f32
@@ -87,7 +133,6 @@ def _mla_mxfp4_stage1(
     stride_q_scale,   # stride per Q row in scale data
     stride_kv_packed, # stride per KV token in packed data
     stride_kv_scale,  # stride per KV token in scale data
-    stride_v_tok,     # stride per V token (576 for bf16)
     stride_po_b, stride_po_s, stride_po_h,
     stride_ml_b, stride_ml_s, stride_ml_h,
     sm_scale,
@@ -95,14 +140,19 @@ def _mla_mxfp4_stage1(
     V_CHUNK_D: tl.constexpr,     # V dims per chunk (128)
     NUM_KV_SPLITS: tl.constexpr,
     NUM_HEADS: tl.constexpr,
+    SCALES_PER_CHUNK: tl.constexpr,  # V_CHUNK_D // 32 = 4
 ):
     """
     Stage 1: For each (batch, split, v_chunk), compute partial attention.
     All 16 Q heads processed together (BLOCK_M=16).
     K dimension tiled in 5 chunks of 128 dims via dot_scaled.
-    V accumulated using regular tl.dot in bf16.
+    V dequantized from MXFP4 packed data (NOT loaded from bf16).
+
+    V dequant approach: split into even/odd elements (from lo/hi nibbles),
+    do two half-width dot products, then interleave at store time.
     """
     LOG2E: tl.constexpr = 1.4426950408889634
+    HALF_CHUNK: tl.constexpr = V_CHUNK_D // 2  # 64
 
     pid_bs = tl.program_id(0)  # batch * splits + split
     pid_v = tl.program_id(2)   # v_chunk index
@@ -122,12 +172,20 @@ def _mla_mxfp4_stage1(
     q_row_base = pid_b * NUM_HEADS
     offs_m = tl.arange(0, NUM_HEADS)  # 0..15
 
-    vd_start = pid_v * V_CHUNK_D
+    # V chunk offset in packed bytes:
+    # V = first 512 dims = first 256 packed bytes
+    # Each v_chunk covers V_CHUNK_D=128 dims = 64 packed bytes
+    v_packed_start = pid_v * HALF_CHUNK  # pid_v * 64 packed bytes
+
+    # V scale offset: each chunk covers V_CHUNK_D/32 = 4 scale blocks
+    v_scale_start = pid_v * SCALES_PER_CHUNK
 
     # Online softmax state per head
     m_prev = tl.full([NUM_HEADS], float("-inf"), dtype=tl.float32)
     l_prev = tl.zeros([NUM_HEADS], dtype=tl.float32)
-    acc = tl.zeros([NUM_HEADS, V_CHUNK_D], dtype=tl.float32)
+    # Two accumulators for even/odd V elements
+    acc_even = tl.zeros([NUM_HEADS, HALF_CHUNK], dtype=tl.float32)
+    acc_odd = tl.zeros([NUM_HEADS, HALF_CHUNK], dtype=tl.float32)
 
     num_tiles = tl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
 
@@ -193,26 +251,86 @@ def _mla_mxfp4_stage1(
         p = tl.math.exp2((qk - m_new[:, None]) * LOG2E)
         p = tl.where(mask_kv[None, :], p, 0.0)
 
-        acc = acc * alpha[:, None]
+        acc_even = acc_even * alpha[:, None]
+        acc_odd = acc_odd * alpha[:, None]
         l_prev = l_prev * alpha + tl.sum(p, 1)
         m_prev = m_new
 
-        # --- Accumulate V: p[16, BLOCK_N] @ V[BLOCK_N, V_CHUNK_D] ---
-        vd_offsets = vd_start + tl.arange(0, V_CHUNK_D)
-        v_tile = tl.load(
-            V_bf16_ptr + kv_idx[:, None] * stride_v_tok + vd_offsets[None, :],
+        # --- Dequantize V from MXFP4 and accumulate ---
+        # Load V packed bytes: [BLOCK_N, HALF_CHUNK] uint8
+        # Each byte has 2 fp4 values: lo nibble = even element, hi nibble = odd element
+        v_byte_offs = v_packed_start + tl.arange(0, HALF_CHUNK)
+        v_packed = tl.load(
+            K_packed_ptr + kv_idx[:, None] * stride_kv_packed + v_byte_offs[None, :],
             mask=mask_kv[:, None],
-            other=0.0,
+            other=0,
         )
-        acc += tl.dot(p.to(tl.bfloat16), v_tile, out_dtype=tl.float32)
 
-    # Store partial outputs
-    po_base = (Partial_O_ptr + pid_b * stride_po_b + pid_s * stride_po_s + vd_start)
+        # Unpack nibbles: [BLOCK_N, HALF_CHUNK]
+        lo_nib = v_packed & 0x0F       # even-index elements
+        hi_nib = (v_packed >> 4) & 0x0F # odd-index elements
+
+        # E2M1 dequant to float32: [BLOCK_N, HALF_CHUNK]
+        lo_f32 = _e2m1_dequant(lo_nib)
+        hi_f32 = _e2m1_dequant(hi_nib)
+
+        # Load V scales: [BLOCK_N, SCALES_PER_CHUNK] uint8 (e8m0)
+        # V scales are the first 16 of 18 scale blocks
+        vs_offs = v_scale_start + tl.arange(0, SCALES_PER_CHUNK)
+        v_scales_raw = tl.load(
+            K_scale_ptr + kv_idx[:, None] * stride_kv_scale + vs_offs[None, :],
+            mask=mask_kv[:, None],
+            other=127,  # exp2(0) = 1.0 neutral scale
+        )
+
+        # E8M0 decode: scale = exp2(uint8 - 127)
+        # [BLOCK_N, SCALES_PER_CHUNK]
+        scale_f32 = tl.math.exp2(v_scales_raw.to(tl.float32) - 127.0)
+
+        # Apply block scales using reshape/broadcast (avoids 2D indexing)
+        # scale_f32: [BLOCK_N, SCALES_PER_CHUNK=4]
+        # Each scale covers 16 packed bytes (32 elements / 2 per byte)
+        # Reshape to [BLOCK_N, SCALES_PER_CHUNK, 1] then broadcast to [BLOCK_N, SCALES_PER_CHUNK, 16]
+        # Then reshape to [BLOCK_N, HALF_CHUNK=64]
+        BYTES_PER_SCALE: tl.constexpr = 16  # 32 elements / 2 per byte
+        scale_expanded = tl.reshape(scale_f32, [BLOCK_N, SCALES_PER_CHUNK, 1])
+        # Broadcast: [BLOCK_N, SCALES_PER_CHUNK, 1] * [1, 1, BYTES_PER_SCALE] -> auto broadcast
+        # But Triton doesn't have auto 3D broadcast easily, use reshape trick:
+        lo_blocked = tl.reshape(lo_f32, [BLOCK_N, SCALES_PER_CHUNK, BYTES_PER_SCALE])
+        hi_blocked = tl.reshape(hi_f32, [BLOCK_N, SCALES_PER_CHUNK, BYTES_PER_SCALE])
+        lo_scaled_blocked = lo_blocked * scale_expanded
+        hi_scaled_blocked = hi_blocked * scale_expanded
+        lo_f32 = tl.reshape(lo_scaled_blocked, [BLOCK_N, HALF_CHUNK])
+        hi_f32 = tl.reshape(hi_scaled_blocked, [BLOCK_N, HALF_CHUNK])
+
+        # lo_f32 and hi_f32 are now scaled
+
+        # Accumulate: p[16, BLOCK_N] @ v[BLOCK_N, HALF_CHUNK]
+        p_bf16 = p.to(tl.bfloat16)
+        acc_even += tl.dot(p_bf16, lo_f32.to(tl.bfloat16), out_dtype=tl.float32)
+        acc_odd += tl.dot(p_bf16, hi_f32.to(tl.bfloat16), out_dtype=tl.float32)
+
+    # --- Store partial outputs ---
+    # Interleave acc_even and acc_odd into [NUM_HEADS, V_CHUNK_D]
+    # out[h, 2*i] = acc_even[h, i], out[h, 2*i+1] = acc_odd[h, i]
+    vd_start = pid_v * V_CHUNK_D
     head_offs = tl.arange(0, NUM_HEADS)
-    v_offs = tl.arange(0, V_CHUNK_D)
+    half_offs = tl.arange(0, HALF_CHUNK)
+
+    po_base = Partial_O_ptr + pid_b * stride_po_b + pid_s * stride_po_s
+
+    # Store even elements at positions 0, 2, 4, ...
+    even_positions = vd_start + 2 * half_offs  # [HALF_CHUNK]
     tl.store(
-        po_base + head_offs[:, None] * stride_po_h + v_offs[None, :],
-        acc,
+        po_base + head_offs[:, None] * stride_po_h + even_positions[None, :],
+        acc_even,
+    )
+
+    # Store odd elements at positions 1, 3, 5, ...
+    odd_positions = vd_start + 2 * half_offs + 1  # [HALF_CHUNK]
+    tl.store(
+        po_base + head_offs[:, None] * stride_po_h + odd_positions[None, :],
+        acc_odd,
     )
 
     # Store m and l (only from v_chunk 0 to avoid redundant writes)
@@ -310,7 +428,8 @@ def _mxfp4_get_buffers(batch_size, num_kv_splits, device):
 def _mxfp4_path(q, kv_data, kv_indptr, config):
     """
     MXFP4 MLA decode using hardware tl.dot_scaled on MI355X.
-    Q quantized to MXFP4, K via dot_scaled, V via bf16 tl.dot.
+    Q quantized to MXFP4, K via dot_scaled, V dequanted from MXFP4.
+    No bf16 KV data loaded — pure MXFP4 path.
     """
     batch_size = config["batch_size"]
     kv_seq_len = config["kv_seq_len"]
@@ -320,22 +439,20 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
     )
 
     kv_fp4, kv_scale = kv_data["mxfp4"]
-    kv_bf16 = kv_data["bf16"]
 
     # Quantize Q to MXFP4
     q_2d = q.view(-1, QK_HEAD_DIM)  # (batch*16, 576)
     q_packed_raw, q_scale_raw = dynamic_mxfp4_quant(q_2d)
-    # Cast to uint8 for Triton (dynamic_mxfp4_quant returns float4_e2m1fn_x2)
     q_packed = q_packed_raw.view(torch.uint8)
     q_scale = q_scale_raw.view(torch.uint8)
 
     # Flatten KV tensors, cast to uint8 for Triton
     kv_fp4_2d = kv_fp4.reshape(-1, PACKED_QK).view(torch.uint8)  # (total_kv, 288)
     kv_scale_2d = kv_scale.view(torch.uint8) if kv_scale.dtype != torch.uint8 else kv_scale
-    v_bf16_2d = kv_bf16.view(-1, QK_HEAD_DIM)  # (total_kv, 576)
 
     BLOCK_N = 64
     V_CHUNK_D = 128
+    SCALES_PER_CHUNK = V_CHUNK_D // 32  # 4
     num_v_chunks = V_HEAD_DIM // V_CHUNK_D  # 512 / 128 = 4
 
     bufs = _mxfp4_get_buffers(batch_size, num_kv_splits, q.device)
@@ -345,18 +462,17 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
     _mla_mxfp4_stage1[grid1](
         q_packed, q_scale,
         kv_fp4_2d, kv_scale_2d,
-        v_bf16_2d,
         bufs["partial_o"], bufs["partial_m"], bufs["partial_l"],
         kv_indptr,
         q_packed.stride(0), q_scale.stride(0),
         kv_fp4_2d.stride(0), kv_scale_2d.stride(0),
-        v_bf16_2d.stride(0),
         bufs["partial_o"].stride(0), bufs["partial_o"].stride(1), bufs["partial_o"].stride(2),
         bufs["partial_m"].stride(0), bufs["partial_m"].stride(1), bufs["partial_m"].stride(2),
         SM_SCALE,
         BLOCK_N=BLOCK_N, V_CHUNK_D=V_CHUNK_D,
         NUM_KV_SPLITS=num_kv_splits,
         NUM_HEADS=NUM_HEADS,
+        SCALES_PER_CHUNK=SCALES_PER_CHUNK,
     )
 
     # Stage 2: reduce across splits
