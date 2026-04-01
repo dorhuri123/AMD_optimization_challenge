@@ -287,35 +287,30 @@ def _mla_mxfp4_stage1(
         # [BLOCK_N, SCALES_PER_CHUNK]
         scale_f32 = tl.math.exp2(v_scales_raw.to(tl.float32) - 127.0)
 
-        # Apply block scales: each scale covers 32 elements = 16 packed bytes
-        # For HALF_CHUNK=64 packed bytes, SCALES_PER_CHUNK=4 scale blocks
-        # Each scale block covers 16 bytes (32 elements / 2 per byte)
-        # We need to broadcast: scale[s] applies to bytes [s*16 : (s+1)*16]
-        # Reshape scale to [BLOCK_N, SCALES_PER_CHUNK, 1] and broadcast over 16 bytes
-        # Then reshape back to [BLOCK_N, HALF_CHUNK]
-
-        # Build scale per-byte: [BLOCK_N, HALF_CHUNK]
-        # byte index within chunk -> scale index = byte_idx // 16
-        byte_idx = tl.arange(0, HALF_CHUNK)  # 0..63
-        scale_idx = byte_idx // 16  # each 16 bytes = one scale group (32 elements)
-
-        # Gather the right scale for each byte position
-        # scale_f32 is [BLOCK_N, SCALES_PER_CHUNK], we want scale_f32[:, scale_idx]
-        # Use a loop over scale groups to build it
-        scale_per_byte = tl.zeros([BLOCK_N, HALF_CHUNK], dtype=tl.float32)
-        for sg in tl.static_range(SCALES_PER_CHUNK):
-            sg_mask = (scale_idx == sg)  # [HALF_CHUNK] bool
-            sg_scale = scale_f32[:, sg]  # [BLOCK_N]
-            scale_per_byte = tl.where(sg_mask[None, :], sg_scale[:, None], scale_per_byte)
+        # Apply block scales using reshape/broadcast (avoids 2D indexing)
+        # scale_f32: [BLOCK_N, SCALES_PER_CHUNK=4]
+        # Each scale covers 16 packed bytes (32 elements / 2 per byte)
+        # Reshape to [BLOCK_N, SCALES_PER_CHUNK, 1] then broadcast to [BLOCK_N, SCALES_PER_CHUNK, 16]
+        # Then reshape to [BLOCK_N, HALF_CHUNK=64]
+        BYTES_PER_SCALE: tl.constexpr = 16  # 32 elements / 2 per byte
+        scale_expanded = tl.reshape(scale_f32, [BLOCK_N, SCALES_PER_CHUNK, 1])
+        # Broadcast: [BLOCK_N, SCALES_PER_CHUNK, 1] * [1, 1, BYTES_PER_SCALE] -> auto broadcast
+        # But Triton doesn't have auto 3D broadcast easily, use reshape trick:
+        lo_blocked = tl.reshape(lo_f32, [BLOCK_N, SCALES_PER_CHUNK, BYTES_PER_SCALE])
+        hi_blocked = tl.reshape(hi_f32, [BLOCK_N, SCALES_PER_CHUNK, BYTES_PER_SCALE])
+        lo_scaled_blocked = lo_blocked * scale_expanded
+        hi_scaled_blocked = hi_blocked * scale_expanded
+        lo_f32 = tl.reshape(lo_scaled_blocked, [BLOCK_N, HALF_CHUNK])
+        hi_f32 = tl.reshape(hi_scaled_blocked, [BLOCK_N, HALF_CHUNK])
 
         # Apply scales to both even and odd elements
         lo_scaled = lo_f32 * scale_per_byte   # [BLOCK_N, HALF_CHUNK]
-        hi_scaled = hi_f32 * scale_per_byte   # [BLOCK_N, HALF_CHUNK]
+        # lo_f32 and hi_f32 are now already scaled
 
         # Accumulate: p[16, BLOCK_N] @ v[BLOCK_N, HALF_CHUNK]
         p_bf16 = p.to(tl.bfloat16)
-        acc_even += tl.dot(p_bf16, lo_scaled.to(tl.bfloat16), out_dtype=tl.float32)
-        acc_odd += tl.dot(p_bf16, hi_scaled.to(tl.bfloat16), out_dtype=tl.float32)
+        acc_even += tl.dot(p_bf16, lo_f32.to(tl.bfloat16), out_dtype=tl.float32)
+        acc_odd += tl.dot(p_bf16, hi_f32.to(tl.bfloat16), out_dtype=tl.float32)
 
     # --- Store partial outputs ---
     # Interleave acc_even and acc_odd into [NUM_HEADS, V_CHUNK_D]
