@@ -303,9 +303,7 @@ def _mla_mxfp4_stage1(
         lo_f32 = tl.reshape(lo_scaled_blocked, [BLOCK_N, HALF_CHUNK])
         hi_f32 = tl.reshape(hi_scaled_blocked, [BLOCK_N, HALF_CHUNK])
 
-        # Apply scales to both even and odd elements
-        lo_scaled = lo_f32 * scale_per_byte   # [BLOCK_N, HALF_CHUNK]
-        # lo_f32 and hi_f32 are now already scaled
+        # lo_f32 and hi_f32 are now scaled
 
         # Accumulate: p[16, BLOCK_N] @ v[BLOCK_N, HALF_CHUNK]
         p_bf16 = p.to(tl.bfloat16)
