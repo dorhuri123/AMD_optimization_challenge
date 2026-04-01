@@ -1,14 +1,19 @@
 """
-Optimized MLA decode submission -- v7.0 MXFP4 V-Dequant + AITER
+Optimized MLA decode submission -- v9.0 AITER Bypass
 
-Critical fix: V is now dequantized from MXFP4 packed data instead of loaded
-from bf16. This reduces V bandwidth from 1024 bytes/token (bf16) to ~270
-bytes/token (fp4x2 + scales), a 3.8x reduction.
+Based on v8.0 with the following additional optimization:
+- Bypass the AITER `mla_decode_fwd` Python wrapper entirely.
+  That wrapper allocates `logits` and `attn_lse` via torch.empty on EVERY call
+  (5-15 us overhead). Instead, we call the underlying C++ functions directly
+  (`aiter.mla_decode_stage1_asm_fwd` and `aiter.mla_reduce_v1`) and cache
+  the intermediate buffers.
 
-MXFP4 path: Q quantized to MXFP4, dot_scaled for QK, V dequanted from fp4x2
-AITER path: Q quantized to FP8, cached metadata, mla_decode_fwd
-
-Routes ALL configs to MXFP4 initially to test V-dequant bandwidth savings.
+Carried forward from v8.0:
+1. Fused FP8 Q quantization via two Triton kernels (replaces 3-op PyTorch path)
+2. Pre-allocated Q FP8 output buffer, scale buffer, and amax scratch buffer
+3. Same routing as v5.0:
+   MXFP4: (4,1024), (4,8192), (32,1024), (64,1024)
+   AITER: (32,8192), (64,8192), (256,1024), (256,8192)
 """
 
 import torch
@@ -16,7 +21,7 @@ import triton
 import triton.language as tl
 from task import input_t, output_t
 
-from aiter.mla import mla_decode_fwd
+import aiter
 from aiter import dtypes as aiter_dtypes
 from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.utility.fp4_utils import dynamic_mxfp4_quant
@@ -39,17 +44,9 @@ FP8_DTYPE = aiter_dtypes.fp8
 PACKED_QK: int = 288       # 576 / 2 packed bytes
 NUM_SCALES: int = 18       # 576 / 32 scale blocks
 
-# V dim layout within MXFP4 buffer:
-# V = first 512 dims = first 256 packed bytes
-# V scales = first 16 of 18 scale blocks (512/32 = 16)
-PACKED_V: int = 256        # 512 / 2 packed bytes
-NUM_V_SCALES: int = 16     # 512 / 32 scale blocks
-
-# Route ALL configs to MXFP4 to test V-dequant bandwidth savings
-MXFP4_CONFIGS = {
-    (4, 1024), (4, 8192), (32, 1024), (64, 1024),
-    (32, 8192), (64, 8192), (256, 1024), (256, 8192),
-}
+# Routing: which configs use MXFP4 vs AITER
+MXFP4_CONFIGS = {(4, 1024), (4, 8192), (32, 1024), (64, 1024)}
+# Everything else goes to AITER: (32,8192), (64,8192), (256,1024), (256,8192)
 
 # MXFP4 split-K tuning
 MXFP4_KV_SPLITS_MAP = {
@@ -57,14 +54,10 @@ MXFP4_KV_SPLITS_MAP = {
     (4, 8192): 16,
     (32, 1024): 4,
     (64, 1024): 4,
-    (32, 8192): 16,
-    (64, 8192): 16,
-    (256, 1024): 4,
-    (256, 8192): 16,
 }
 MXFP4_DEFAULT_KV_SPLITS = 8
 
-# AITER split-K tuning (fallback)
+# AITER split-K tuning
 AITER_KV_SPLITS_MAP = {
     (32, 8192): 48,
     (64, 8192): 24,
@@ -77,54 +70,139 @@ AITER_DEFAULT_KV_SPLITS = 16
 _mxfp4_buf_cache: dict = {}
 _meta_cache: dict = {}
 _alloc_cache: dict = {}
+_fp8_buf_cache: dict = {}
 
 
 # ===============================================================
-# E2M1 DEQUANT HELPER (used inside Triton kernel)
+# FUSED FP8 QUANTIZATION TRITON KERNELS
 # ===============================================================
-# Each nibble: sign(1) | exp(2) | mant(1)
-# exp=0: denorm, val = sign * 0.5 * mant  (so 0 or 0.5)
-# exp=1-3: normal, val = sign * 2^(exp-1) * (1 + 0.5*mant)
-# E8M0 scale: exp2(scale_uint8 - 127.0)
+
+@triton.jit
+def _amax_kernel(
+    input_ptr,       # [N] flat input (any float type)
+    amax_ptr,        # [1] output: global amax (float32)
+    N,               # total number of elements
+    BLOCK: tl.constexpr,
+):
+    """Each block computes local amax, then atomically updates global max."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+
+    x = tl.load(input_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    local_amax = tl.max(tl.abs(x))
+
+    # tl.atomic_max expects the same dtype as the pointer; amax_ptr is float32
+    tl.atomic_max(amax_ptr, local_amax)
 
 
 @triton.jit
-def _e2m1_dequant(nibbles):
-    """
-    Dequantize a tensor of uint8 nibble values (0-15) to float32.
-    Each nibble encodes: sign(1) | exp(2) | mant(1) in E2M1 format.
-    """
-    nibbles_i32 = nibbles.to(tl.int32)
+def _quantize_fp8_kernel(
+    input_ptr,       # [N] flat input (any float type)
+    output_ptr,      # [N] flat output (fp8)
+    amax_ptr,        # [1] global amax (float32), read-only
+    scale_ptr,       # [1] output: scale (float32)
+    fp8_max,         # scalar constexpr: max representable FP8 value
+    fp8_min,         # scalar constexpr: min representable FP8 value (negative)
+    N,               # total number of elements
+    BLOCK: tl.constexpr,
+):
+    """Read global amax, compute scale = amax / fp8_max, quantize elements."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
 
-    sign_bit = (nibbles_i32 >> 3) & 1       # bit 3
-    exp_bits = (nibbles_i32 >> 1) & 0x3      # bits 2:1
-    mant_bit = nibbles_i32 & 1               # bit 0
+    # Every block reads the same global amax (L1 cached after first read)
+    amax = tl.load(amax_ptr)
+    # Clamp to avoid division by zero
+    amax = tl.maximum(amax, 1e-12)
+    scale = amax / fp8_max
 
-    sign_f = tl.where(sign_bit == 1, -1.0, 1.0)
-    mant_f = mant_bit.to(tl.float32)
-    exp_f = exp_bits.to(tl.float32)
+    # Program 0 writes scale to output
+    if pid == 0:
+        tl.store(scale_ptr, scale)
 
-    # Denorm case (exp=0): val = 0.5 * mant (so 0.0 or 0.5)
-    denorm_val = 0.5 * mant_f
+    # Load, scale, clamp, cast
+    x = tl.load(input_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    x_scaled = x / scale
+    x_clamped = tl.minimum(tl.maximum(x_scaled, fp8_min), fp8_max)
 
-    # Normal case (exp=1,2,3): val = 2^(exp-1) * (1 + 0.5*mant)
-    # exp=1 -> 1.0*(1+0.5m), exp=2 -> 2.0*(1+0.5m), exp=3 -> 4.0*(1+0.5m)
-    normal_val = tl.math.exp2(exp_f - 1.0) * (1.0 + 0.5 * mant_f)
-
-    val = tl.where(exp_bits == 0, denorm_val, normal_val)
-    return sign_f * val
+    # Cast to output pointer's dtype (fp8) -- let Triton infer from output_ptr
+    tl.store(output_ptr + offs, x_clamped, mask=mask)
 
 
 # ===============================================================
-# MXFP4 TRITON KERNEL -- STAGE 1 (V from MXFP4)
+# FUSED FP8 QUANTIZATION HOST WRAPPER (with pre-allocated buffers)
+# ===============================================================
+
+def _get_fp8_buffers(num_elements, shape, device):
+    """Get or allocate pre-allocated FP8 quantization buffers."""
+    key = (num_elements, device)
+    if key not in _fp8_buf_cache:
+        _fp8_buf_cache[key] = {
+            "fp8_out": torch.empty(num_elements, dtype=FP8_DTYPE, device=device),
+            "scale_out": torch.empty(1, dtype=torch.float32, device=device),
+            "amax_buf": torch.zeros(1, dtype=torch.float32, device=device),
+        }
+    return _fp8_buf_cache[key]
+
+
+def fused_quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize a tensor to FP8 using two fused Triton kernels with pre-allocated buffers.
+
+    Returns:
+        (fp8_tensor, scale) where:
+            fp8_tensor: same shape as input, dtype=FP8_DTYPE
+            scale: shape (1,), dtype=float32
+    """
+    finfo = torch.finfo(FP8_DTYPE)
+    fp8_max_val = finfo.max
+    fp8_min_val = finfo.min
+
+    # Flatten for kernel indexing
+    flat = tensor.reshape(-1)
+    N = flat.numel()
+
+    # Get pre-allocated buffers
+    bufs = _get_fp8_buffers(N, tensor.shape, tensor.device)
+    fp8_flat = bufs["fp8_out"]
+    scale_out = bufs["scale_out"]
+    amax_buf = bufs["amax_buf"]
+
+    # Reset amax to zero before reduction
+    amax_buf.zero_()
+
+    BLOCK = 1024
+    grid_size = (N + BLOCK - 1) // BLOCK
+
+    # Kernel 1: compute global amax
+    _amax_kernel[(grid_size,)](
+        flat, amax_buf, N,
+        BLOCK=BLOCK,
+    )
+
+    # Kernel 2: quantize using the computed amax
+    _quantize_fp8_kernel[(grid_size,)](
+        flat, fp8_flat, amax_buf, scale_out,
+        fp8_max_val, fp8_min_val, N,
+        BLOCK=BLOCK,
+    )
+
+    return fp8_flat.view(tensor.shape), scale_out
+
+
+# ===============================================================
+# MXFP4 TRITON KERNEL -- STAGE 1
 # ===============================================================
 
 @triton.jit
 def _mla_mxfp4_stage1(
     Q_packed_ptr,     # [batch*16, 288] uint8 (packed e2m1)
     Q_scale_ptr,      # [batch*16, 18] uint8 (e8m0 scales)
-    K_packed_ptr,     # [total_kv, 288] uint8 (packed e2m1) — K AND V
-    K_scale_ptr,      # [total_kv, 18] uint8 (e8m0 scales) — K AND V scales
+    K_packed_ptr,     # [total_kv, 288] uint8 (packed e2m1)
+    K_scale_ptr,      # [total_kv, 18] uint8 (e8m0 scales)
+    V_bf16_ptr,       # [total_kv, 576] bf16 (first 512 dims used)
     Partial_O_ptr,    # [batch, splits, 16, V_DIM] f32
     Partial_m_ptr,    # [batch, splits, 16] f32
     Partial_l_ptr,    # [batch, splits, 16] f32
@@ -133,6 +211,7 @@ def _mla_mxfp4_stage1(
     stride_q_scale,   # stride per Q row in scale data
     stride_kv_packed, # stride per KV token in packed data
     stride_kv_scale,  # stride per KV token in scale data
+    stride_v_tok,     # stride per V token (576 for bf16)
     stride_po_b, stride_po_s, stride_po_h,
     stride_ml_b, stride_ml_s, stride_ml_h,
     sm_scale,
@@ -140,19 +219,14 @@ def _mla_mxfp4_stage1(
     V_CHUNK_D: tl.constexpr,     # V dims per chunk (128)
     NUM_KV_SPLITS: tl.constexpr,
     NUM_HEADS: tl.constexpr,
-    SCALES_PER_CHUNK: tl.constexpr,  # V_CHUNK_D // 32 = 4
 ):
     """
     Stage 1: For each (batch, split, v_chunk), compute partial attention.
     All 16 Q heads processed together (BLOCK_M=16).
     K dimension tiled in 5 chunks of 128 dims via dot_scaled.
-    V dequantized from MXFP4 packed data (NOT loaded from bf16).
-
-    V dequant approach: split into even/odd elements (from lo/hi nibbles),
-    do two half-width dot products, then interleave at store time.
+    V accumulated using regular tl.dot in bf16.
     """
     LOG2E: tl.constexpr = 1.4426950408889634
-    HALF_CHUNK: tl.constexpr = V_CHUNK_D // 2  # 64
 
     pid_bs = tl.program_id(0)  # batch * splits + split
     pid_v = tl.program_id(2)   # v_chunk index
@@ -172,20 +246,12 @@ def _mla_mxfp4_stage1(
     q_row_base = pid_b * NUM_HEADS
     offs_m = tl.arange(0, NUM_HEADS)  # 0..15
 
-    # V chunk offset in packed bytes:
-    # V = first 512 dims = first 256 packed bytes
-    # Each v_chunk covers V_CHUNK_D=128 dims = 64 packed bytes
-    v_packed_start = pid_v * HALF_CHUNK  # pid_v * 64 packed bytes
-
-    # V scale offset: each chunk covers V_CHUNK_D/32 = 4 scale blocks
-    v_scale_start = pid_v * SCALES_PER_CHUNK
+    vd_start = pid_v * V_CHUNK_D
 
     # Online softmax state per head
     m_prev = tl.full([NUM_HEADS], float("-inf"), dtype=tl.float32)
     l_prev = tl.zeros([NUM_HEADS], dtype=tl.float32)
-    # Two accumulators for even/odd V elements
-    acc_even = tl.zeros([NUM_HEADS, HALF_CHUNK], dtype=tl.float32)
-    acc_odd = tl.zeros([NUM_HEADS, HALF_CHUNK], dtype=tl.float32)
+    acc = tl.zeros([NUM_HEADS, V_CHUNK_D], dtype=tl.float32)
 
     num_tiles = tl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
 
@@ -251,86 +317,26 @@ def _mla_mxfp4_stage1(
         p = tl.math.exp2((qk - m_new[:, None]) * LOG2E)
         p = tl.where(mask_kv[None, :], p, 0.0)
 
-        acc_even = acc_even * alpha[:, None]
-        acc_odd = acc_odd * alpha[:, None]
+        acc = acc * alpha[:, None]
         l_prev = l_prev * alpha + tl.sum(p, 1)
         m_prev = m_new
 
-        # --- Dequantize V from MXFP4 and accumulate ---
-        # Load V packed bytes: [BLOCK_N, HALF_CHUNK] uint8
-        # Each byte has 2 fp4 values: lo nibble = even element, hi nibble = odd element
-        v_byte_offs = v_packed_start + tl.arange(0, HALF_CHUNK)
-        v_packed = tl.load(
-            K_packed_ptr + kv_idx[:, None] * stride_kv_packed + v_byte_offs[None, :],
+        # --- Accumulate V: p[16, BLOCK_N] @ V[BLOCK_N, V_CHUNK_D] ---
+        vd_offsets = vd_start + tl.arange(0, V_CHUNK_D)
+        v_tile = tl.load(
+            V_bf16_ptr + kv_idx[:, None] * stride_v_tok + vd_offsets[None, :],
             mask=mask_kv[:, None],
-            other=0,
+            other=0.0,
         )
+        acc += tl.dot(p.to(tl.bfloat16), v_tile, out_dtype=tl.float32)
 
-        # Unpack nibbles: [BLOCK_N, HALF_CHUNK]
-        lo_nib = v_packed & 0x0F       # even-index elements
-        hi_nib = (v_packed >> 4) & 0x0F # odd-index elements
-
-        # E2M1 dequant to float32: [BLOCK_N, HALF_CHUNK]
-        lo_f32 = _e2m1_dequant(lo_nib)
-        hi_f32 = _e2m1_dequant(hi_nib)
-
-        # Load V scales: [BLOCK_N, SCALES_PER_CHUNK] uint8 (e8m0)
-        # V scales are the first 16 of 18 scale blocks
-        vs_offs = v_scale_start + tl.arange(0, SCALES_PER_CHUNK)
-        v_scales_raw = tl.load(
-            K_scale_ptr + kv_idx[:, None] * stride_kv_scale + vs_offs[None, :],
-            mask=mask_kv[:, None],
-            other=127,  # exp2(0) = 1.0 neutral scale
-        )
-
-        # E8M0 decode: scale = exp2(uint8 - 127)
-        # [BLOCK_N, SCALES_PER_CHUNK]
-        scale_f32 = tl.math.exp2(v_scales_raw.to(tl.float32) - 127.0)
-
-        # Apply block scales using reshape/broadcast (avoids 2D indexing)
-        # scale_f32: [BLOCK_N, SCALES_PER_CHUNK=4]
-        # Each scale covers 16 packed bytes (32 elements / 2 per byte)
-        # Reshape to [BLOCK_N, SCALES_PER_CHUNK, 1] then broadcast to [BLOCK_N, SCALES_PER_CHUNK, 16]
-        # Then reshape to [BLOCK_N, HALF_CHUNK=64]
-        BYTES_PER_SCALE: tl.constexpr = 16  # 32 elements / 2 per byte
-        scale_expanded = tl.reshape(scale_f32, [BLOCK_N, SCALES_PER_CHUNK, 1])
-        # Broadcast: [BLOCK_N, SCALES_PER_CHUNK, 1] * [1, 1, BYTES_PER_SCALE] -> auto broadcast
-        # But Triton doesn't have auto 3D broadcast easily, use reshape trick:
-        lo_blocked = tl.reshape(lo_f32, [BLOCK_N, SCALES_PER_CHUNK, BYTES_PER_SCALE])
-        hi_blocked = tl.reshape(hi_f32, [BLOCK_N, SCALES_PER_CHUNK, BYTES_PER_SCALE])
-        lo_scaled_blocked = lo_blocked * scale_expanded
-        hi_scaled_blocked = hi_blocked * scale_expanded
-        lo_f32 = tl.reshape(lo_scaled_blocked, [BLOCK_N, HALF_CHUNK])
-        hi_f32 = tl.reshape(hi_scaled_blocked, [BLOCK_N, HALF_CHUNK])
-
-        # lo_f32 and hi_f32 are now scaled
-
-        # Accumulate: p[16, BLOCK_N] @ v[BLOCK_N, HALF_CHUNK]
-        p_bf16 = p.to(tl.bfloat16)
-        acc_even += tl.dot(p_bf16, lo_f32.to(tl.bfloat16), out_dtype=tl.float32)
-        acc_odd += tl.dot(p_bf16, hi_f32.to(tl.bfloat16), out_dtype=tl.float32)
-
-    # --- Store partial outputs ---
-    # Interleave acc_even and acc_odd into [NUM_HEADS, V_CHUNK_D]
-    # out[h, 2*i] = acc_even[h, i], out[h, 2*i+1] = acc_odd[h, i]
-    vd_start = pid_v * V_CHUNK_D
+    # Store partial outputs
+    po_base = (Partial_O_ptr + pid_b * stride_po_b + pid_s * stride_po_s + vd_start)
     head_offs = tl.arange(0, NUM_HEADS)
-    half_offs = tl.arange(0, HALF_CHUNK)
-
-    po_base = Partial_O_ptr + pid_b * stride_po_b + pid_s * stride_po_s
-
-    # Store even elements at positions 0, 2, 4, ...
-    even_positions = vd_start + 2 * half_offs  # [HALF_CHUNK]
+    v_offs = tl.arange(0, V_CHUNK_D)
     tl.store(
-        po_base + head_offs[:, None] * stride_po_h + even_positions[None, :],
-        acc_even,
-    )
-
-    # Store odd elements at positions 1, 3, 5, ...
-    odd_positions = vd_start + 2 * half_offs + 1  # [HALF_CHUNK]
-    tl.store(
-        po_base + head_offs[:, None] * stride_po_h + odd_positions[None, :],
-        acc_odd,
+        po_base + head_offs[:, None] * stride_po_h + v_offs[None, :],
+        acc,
     )
 
     # Store m and l (only from v_chunk 0 to avoid redundant writes)
@@ -428,8 +434,7 @@ def _mxfp4_get_buffers(batch_size, num_kv_splits, device):
 def _mxfp4_path(q, kv_data, kv_indptr, config):
     """
     MXFP4 MLA decode using hardware tl.dot_scaled on MI355X.
-    Q quantized to MXFP4, K via dot_scaled, V dequanted from MXFP4.
-    No bf16 KV data loaded — pure MXFP4 path.
+    Q quantized to MXFP4, K via dot_scaled, V via bf16 tl.dot.
     """
     batch_size = config["batch_size"]
     kv_seq_len = config["kv_seq_len"]
@@ -439,20 +444,22 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
     )
 
     kv_fp4, kv_scale = kv_data["mxfp4"]
+    kv_bf16 = kv_data["bf16"]
 
     # Quantize Q to MXFP4
     q_2d = q.view(-1, QK_HEAD_DIM)  # (batch*16, 576)
     q_packed_raw, q_scale_raw = dynamic_mxfp4_quant(q_2d)
+    # Cast to uint8 for Triton (dynamic_mxfp4_quant returns float4_e2m1fn_x2)
     q_packed = q_packed_raw.view(torch.uint8)
     q_scale = q_scale_raw.view(torch.uint8)
 
     # Flatten KV tensors, cast to uint8 for Triton
     kv_fp4_2d = kv_fp4.reshape(-1, PACKED_QK).view(torch.uint8)  # (total_kv, 288)
     kv_scale_2d = kv_scale.view(torch.uint8) if kv_scale.dtype != torch.uint8 else kv_scale
+    v_bf16_2d = kv_bf16.view(-1, QK_HEAD_DIM)  # (total_kv, 576)
 
     BLOCK_N = 64
     V_CHUNK_D = 128
-    SCALES_PER_CHUNK = V_CHUNK_D // 32  # 4
     num_v_chunks = V_HEAD_DIM // V_CHUNK_D  # 512 / 128 = 4
 
     bufs = _mxfp4_get_buffers(batch_size, num_kv_splits, q.device)
@@ -462,17 +469,18 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
     _mla_mxfp4_stage1[grid1](
         q_packed, q_scale,
         kv_fp4_2d, kv_scale_2d,
+        v_bf16_2d,
         bufs["partial_o"], bufs["partial_m"], bufs["partial_l"],
         kv_indptr,
         q_packed.stride(0), q_scale.stride(0),
         kv_fp4_2d.stride(0), kv_scale_2d.stride(0),
+        v_bf16_2d.stride(0),
         bufs["partial_o"].stride(0), bufs["partial_o"].stride(1), bufs["partial_o"].stride(2),
         bufs["partial_m"].stride(0), bufs["partial_m"].stride(1), bufs["partial_m"].stride(2),
         SM_SCALE,
         BLOCK_N=BLOCK_N, V_CHUNK_D=V_CHUNK_D,
         NUM_KV_SPLITS=num_kv_splits,
         NUM_HEADS=NUM_HEADS,
-        SCALES_PER_CHUNK=SCALES_PER_CHUNK,
     )
 
     # Stage 2: reduce across splits
@@ -491,19 +499,7 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
 
 
 # ===============================================================
-# FP8 QUANTIZATION (for AITER path)
-# ===============================================================
-
-def quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    finfo = torch.finfo(FP8_DTYPE)
-    amax = tensor.abs().amax().clamp(min=1e-12)
-    scale = amax / finfo.max
-    fp8_tensor = (tensor / scale).clamp(min=finfo.min, max=finfo.max).to(FP8_DTYPE)
-    return fp8_tensor, scale.to(torch.float32).reshape(1)
-
-
-# ===============================================================
-# AITER CACHED METADATA
+# AITER CACHED METADATA (with cached logits/attn_lse work buffers)
 # ===============================================================
 
 def _get_cached_meta(bs, nq, nkv, q_dtype, kv_dtype, qo_indptr, kv_indptr, num_kv_splits):
@@ -529,10 +525,26 @@ def _get_cached_meta(bs, nq, nkv, q_dtype, kv_dtype, qo_indptr, kv_indptr, num_k
             fast_mode=False, max_split_per_batch=num_kv_splits,
             intra_batch_mode=True, dtype_q=q_dtype, dtype_kv=kv_dtype,
         )
+
+        # Cache the internal work buffers that mla_decode_fwd normally allocates
+        # every call. In persistent mode with max_seqlen_q=1, nhead=16:
+        #   logits shape: (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim)
+        #   attn_lse shape: (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1)
+        num_partials = rpm.size(0)
+        logits = torch.empty(
+            (num_partials, 1, NUM_HEADS, V_HEAD_DIM),
+            dtype=torch.float32, device="cuda",
+        )
+        attn_lse = torch.empty(
+            (num_partials, 1, NUM_HEADS, 1),
+            dtype=torch.float32, device="cuda",
+        )
+
         _meta_cache[key] = {
             "work_meta_data": wm, "work_indptr": wi, "work_info_set": wis,
             "reduce_indptr": ri, "reduce_final_map": rfm, "reduce_partial_map": rpm,
             "kv_indices": kv_indices, "kv_last_page_len": kv_last_page_len,
+            "logits": logits, "attn_lse": attn_lse,
         }
     return _meta_cache[key]
 
@@ -547,16 +559,21 @@ def _get_cached_allocs(bs, nq, device):
 
 
 # ===============================================================
-# AITER DECODE PATH
+# AITER DECODE PATH (bypassing mla_decode_fwd Python wrapper)
 # ===============================================================
 
 def _aiter_path(q, kv_data, qo_indptr, kv_indptr, config):
-    """AITER cached a8w8 path for large configs."""
+    """
+    AITER path calling C++ functions directly, bypassing the Python wrapper.
+    Saves 5-15 us per call by eliminating torch.empty allocations for
+    logits and attn_lse intermediate buffers.
+    """
     bs = config["batch_size"]
     kvlen = config["kv_seq_len"]
     num_kv_splits = AITER_KV_SPLITS_MAP.get((bs, kvlen), AITER_DEFAULT_KV_SPLITS)
 
-    q_fp8, q_scale = quantize_fp8(q)
+    # Fused FP8 quantization (2 Triton kernels instead of 3 PyTorch ops)
+    q_fp8, q_scale = fused_quantize_fp8(q)
 
     kv_fp8, kv_scale = kv_data["fp8"]
 
@@ -570,24 +587,63 @@ def _aiter_path(q, kv_data, qo_indptr, kv_indptr, config):
 
     kv_4d = kv_fp8.view(kv_fp8.shape[0], PAGE_SIZE, NUM_KV_HEADS, kv_fp8.shape[-1])
 
-    mla_decode_fwd(
+    # Retrieve cached work buffers (no allocation!)
+    logits = meta["logits"]
+    attn_lse = meta["attn_lse"]
+
+    # Direct call to AITER C++ stage1 (bypassing mla_decode_fwd wrapper)
+    # Signature from aiter_mla.py persistent mode branch (lines 398-419):
+    #   aiter.mla_decode_stage1_asm_fwd(
+    #       q, kv_buffer,
+    #       qo_indptr, kv_indptr, kv_indices, kv_last_page_lens,
+    #       num_kv_splits_indptr,      # None in persistent mode
+    #       work_meta_data, work_indptr, work_info_set,
+    #       max_seqlen_q, page_size, nhead_kv, sm_scale,
+    #       logits, attn_lse, o,
+    #       final_lse,                 # None (not returning lse)
+    #       q_scale, kv_scale,
+    #   )
+    aiter.mla_decode_stage1_asm_fwd(
         q_fp8.view(-1, NUM_HEADS, QK_HEAD_DIM),
-        kv_4d, o,
-        qo_indptr, kv_indptr,
-        meta["kv_indices"], meta["kv_last_page_len"],
-        1,
-        page_size=PAGE_SIZE, nhead_kv=NUM_KV_HEADS,
-        sm_scale=SM_SCALE, logit_cap=0.0,
-        num_kv_splits=num_kv_splits,
-        q_scale=q_scale, kv_scale=kv_scale,
-        intra_batch_mode=True,
-        work_meta_data=meta["work_meta_data"],
-        work_indptr=meta["work_indptr"],
-        work_info_set=meta["work_info_set"],
-        reduce_indptr=meta["reduce_indptr"],
-        reduce_final_map=meta["reduce_final_map"],
-        reduce_partial_map=meta["reduce_partial_map"],
+        kv_4d,
+        qo_indptr,
+        kv_indptr,
+        meta["kv_indices"],
+        meta["kv_last_page_len"],
+        None,                              # num_kv_splits_indptr (unused in persistent mode)
+        meta["work_meta_data"],
+        meta["work_indptr"],
+        meta["work_info_set"],
+        1,                                 # max_seqlen_q
+        PAGE_SIZE,                         # page_size
+        NUM_KV_HEADS,                      # nhead_kv
+        SM_SCALE,                          # sm_scale
+        logits,                            # splitData (cached)
+        attn_lse,                          # splitLse (cached)
+        o,                                 # output
+        q_scale,                           # q_scale
+        kv_scale,                          # kv_scale
     )
+
+    # Direct call to AITER C++ reduce (bypassing mla_decode_fwd wrapper)
+    # Signature from aiter_mla.py line 421-430:
+    #   aiter.mla_reduce_v1(
+    #       logits, attn_lse,
+    #       reduce_indptr, reduce_final_map, reduce_partial_map,
+    #       max_seqlen_q,
+    #       o, final_lse,
+    #   )
+    aiter.mla_reduce_v1(
+        logits,
+        attn_lse,
+        meta["reduce_indptr"],
+        meta["reduce_final_map"],
+        meta["reduce_partial_map"],
+        1,                                 # max_seqlen_q
+        o,                                 # final_output
+        None,                              # final_lse
+    )
+
     return o
 
 

@@ -78,7 +78,8 @@ def _quantize_fp8_kernel(
     x_scaled = x / scale
     x_clamped = tl.minimum(tl.maximum(x_scaled, fp8_min), fp8_max)
 
-    tl.store(output_ptr + offs, x_clamped.to(tl.float8e4m3fnuz), mask=mask)
+    # Cast to output pointer's dtype (fp8) — let Triton infer from output_ptr
+    tl.store(output_ptr + offs, x_clamped, mask=mask)
 
 
 # ---------------------------------------------------------------

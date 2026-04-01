@@ -621,7 +621,6 @@ def _aiter_path(q, kv_data, qo_indptr, kv_indptr, config):
         logits,                            # splitData (cached)
         attn_lse,                          # splitLse (cached)
         o,                                 # output
-        None,                              # final_lse
         q_scale,                           # q_scale
         kv_scale,                          # kv_scale
     )
