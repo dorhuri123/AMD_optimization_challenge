@@ -1,11 +1,15 @@
 """
-Optimized MLA decode submission — v3.3 (Hybrid Triton + AITER)
+Optimized MLA decode submission -- v5.0 Hybrid (MXFP4 + AITER)
 
-Optimizations:
-  1. Bare Triton FP8 kernel for bs=4,kv=1024 (skip AITER+Q_quant entirely)
-  2. Cache AITER metadata across repeated calls
-  3. Cache output buffer allocation
-  4. Tuned NUM_KV_SPLITS per config
+Routes small configs to MXFP4 Triton kernel (dot_scaled on MI355X/gfx950)
+and large configs to AITER cached a8w8 path.
+
+Routing:
+  MXFP4: (4,1024), (4,8192), (32,1024), (64,1024)
+  AITER: (32,8192), (64,8192), (256,1024), (256,8192)
+
+MXFP4 path: Q quantized to MXFP4, dot_scaled for QK, bf16 V via tl.dot
+AITER path: Q quantized to FP8, cached metadata, mla_decode_fwd
 """
 
 import torch
@@ -16,78 +20,93 @@ from task import input_t, output_t
 from aiter.mla import mla_decode_fwd
 from aiter import dtypes as aiter_dtypes
 from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
+from aiter.utility.fp4_utils import dynamic_mxfp4_quant
 
-NUM_HEADS = 16
-NUM_KV_HEADS = 1
-KV_LORA_RANK = 512
-QK_ROPE_HEAD_DIM = 64
-QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM
-V_HEAD_DIM = KV_LORA_RANK
-SM_SCALE = 1.0 / (QK_HEAD_DIM ** 0.5)
-PAGE_SIZE = 1
+# ===============================================================
+# CONSTANTS
+# ===============================================================
+
+NUM_HEADS: int = 16
+NUM_KV_HEADS: int = 1
+KV_LORA_RANK: int = 512
+QK_ROPE_HEAD_DIM: int = 64
+QK_HEAD_DIM: int = 576  # KV_LORA_RANK + QK_ROPE_HEAD_DIM
+V_HEAD_DIM: int = 512   # KV_LORA_RANK
+SM_SCALE: float = 1.0 / (QK_HEAD_DIM ** 0.5)
+PAGE_SIZE: int = 1
 FP8_DTYPE = aiter_dtypes.fp8
 
-# Configs routed to bare Triton (skip AITER + Q_quant entirely)
-TRITON_CONFIGS = {(4, 1024)}
+# K dim layout: 576 = 4*128 + 64 -> 5 tiles of 128 (last padded)
+PACKED_QK: int = 288       # 576 / 2 packed bytes
+NUM_SCALES: int = 18       # 576 / 32 scale blocks
+
+# Routing: which configs use MXFP4 vs AITER
+MXFP4_CONFIGS = {(4, 1024), (4, 8192), (32, 1024), (64, 1024)}
+# Everything else goes to AITER: (32,8192), (64,8192), (256,1024), (256,8192)
+
+# MXFP4 split-K tuning
+MXFP4_KV_SPLITS_MAP = {
+    (4, 1024): 4,
+    (4, 8192): 16,
+    (32, 1024): 4,
+    (64, 1024): 4,
+}
+MXFP4_DEFAULT_KV_SPLITS = 8
 
 # AITER split-K tuning
-KV_SPLITS_MAP = {
-    (4, 1024): 16,
-    (4, 8192): 32,
-    (32, 1024): 16,
+AITER_KV_SPLITS_MAP = {
     (32, 8192): 48,
-    (64, 1024): 16,
     (64, 8192): 24,
     (256, 1024): 16,
     (256, 8192): 24,
 }
-DEFAULT_KV_SPLITS = 16
-
-# Triton split-K tuning
-TRITON_KV_SPLITS = {(4, 1024): 4}
+AITER_DEFAULT_KV_SPLITS = 16
 
 # Caches
-_meta_cache = {}
-_alloc_cache = {}
-_triton_buf_cache = {}
+_mxfp4_buf_cache: dict = {}
+_meta_cache: dict = {}
+_alloc_cache: dict = {}
 
 
-# ═══════════════════════════════════════════════════════════
-# FIXED-SCALE FP8 QUANTIZATION (skip amax reduction)
-# ═══════════════════════════════════════════════════════════
-
-def quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    finfo = torch.finfo(FP8_DTYPE)
-    amax = tensor.abs().amax().clamp(min=1e-12)
-    scale = amax / finfo.max
-    fp8_tensor = (tensor / scale).clamp(min=finfo.min, max=finfo.max).to(FP8_DTYPE)
-    return fp8_tensor, scale.to(torch.float32).reshape(1)
-
-
-# ═══════════════════════════════════════════════════════════
-# TRITON FP8 DECODE KERNEL (zero AITER overhead)
-# ═══════════════════════════════════════════════════════════
+# ===============================================================
+# MXFP4 TRITON KERNEL -- STAGE 1
+# ===============================================================
 
 @triton.jit
-def _mla_stage1_fp8(
-    Q_ptr, KV_ptr, kv_scale_ptr,
-    Partial_O_ptr, Partial_m_ptr, Partial_l_ptr,
-    kv_indptr_ptr,
-    stride_q_batch, stride_q_head, stride_kv_tok,
+def _mla_mxfp4_stage1(
+    Q_packed_ptr,     # [batch*16, 288] uint8 (packed e2m1)
+    Q_scale_ptr,      # [batch*16, 18] uint8 (e8m0 scales)
+    K_packed_ptr,     # [total_kv, 288] uint8 (packed e2m1)
+    K_scale_ptr,      # [total_kv, 18] uint8 (e8m0 scales)
+    V_bf16_ptr,       # [total_kv, 576] bf16 (first 512 dims used)
+    Partial_O_ptr,    # [batch, splits, 16, V_DIM] f32
+    Partial_m_ptr,    # [batch, splits, 16] f32
+    Partial_l_ptr,    # [batch, splits, 16] f32
+    kv_indptr_ptr,    # [batch+1] i32
+    stride_q_packed,  # stride per Q row in packed data
+    stride_q_scale,   # stride per Q row in scale data
+    stride_kv_packed, # stride per KV token in packed data
+    stride_kv_scale,  # stride per KV token in scale data
+    stride_v_tok,     # stride per V token (576 for bf16)
     stride_po_b, stride_po_s, stride_po_h,
     stride_ml_b, stride_ml_s, stride_ml_h,
     sm_scale,
-    BLOCK_KV: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,       # KV tokens per tile
+    V_CHUNK_D: tl.constexpr,     # V dims per chunk (128)
     NUM_KV_SPLITS: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
 ):
-    """Stage 1: per (batch, split, head), accumulate all 512 V dims."""
+    """
+    Stage 1: For each (batch, split, v_chunk), compute partial attention.
+    All 16 Q heads processed together (BLOCK_M=16).
+    K dimension tiled in 5 chunks of 128 dims via dot_scaled.
+    V accumulated using regular tl.dot in bf16.
+    """
     LOG2E: tl.constexpr = 1.4426950408889634
-    QK_DIM: tl.constexpr = 576
-    V_DIM: tl.constexpr = 512
 
-    pid_bs = tl.program_id(0)
-    pid_h = tl.program_id(1)
+    pid_bs = tl.program_id(0)  # batch * splits + split
+    pid_v = tl.program_id(2)   # v_chunk index
+
     pid_b = pid_bs // NUM_KV_SPLITS
     pid_s = pid_bs % NUM_KV_SPLITS
 
@@ -99,172 +118,277 @@ def _mla_stage1_fp8(
     split_kv_start = pid_s * split_size
     split_kv_end = tl.minimum(split_kv_start + split_size, kv_len)
 
-    kv_scale = tl.load(kv_scale_ptr)
-    q_base = Q_ptr + pid_b * stride_q_batch + pid_h * stride_q_head
+    # Q pointers for this batch element (all 16 heads)
+    q_row_base = pid_b * NUM_HEADS
+    offs_m = tl.arange(0, NUM_HEADS)  # 0..15
 
-    m_prev = tl.full([], float("-inf"), dtype=tl.float32)
-    l_prev = tl.full([], 0.0, dtype=tl.float32)
+    vd_start = pid_v * V_CHUNK_D
 
-    acc0 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    acc1 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    acc2 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    acc3 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    acc4 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    acc5 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    acc6 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    acc7 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    # Online softmax state per head
+    m_prev = tl.full([NUM_HEADS], float("-inf"), dtype=tl.float32)
+    l_prev = tl.zeros([NUM_HEADS], dtype=tl.float32)
+    acc = tl.zeros([NUM_HEADS, V_CHUNK_D], dtype=tl.float32)
 
-    num_tiles = tl.cdiv(split_kv_end - split_kv_start, BLOCK_KV)
+    num_tiles = tl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
 
     for tile_idx in range(num_tiles):
-        tile_start = split_kv_start + tile_idx * BLOCK_KV
-        kv_offsets = tile_start + tl.arange(0, BLOCK_KV)
+        tile_start = split_kv_start + tile_idx * BLOCK_N
+        kv_offsets = tile_start + tl.arange(0, BLOCK_N)
         mask_kv = kv_offsets < split_kv_end
-        kv_idx = kv_start + kv_offsets
+        kv_idx = kv_start + kv_offsets  # global KV indices
 
-        scores = tl.zeros([BLOCK_KV], dtype=tl.float32)
-        for d_tile in tl.static_range(QK_DIM // BLOCK_D):
-            d_start = d_tile * BLOCK_D
-            d_offsets = d_start + tl.arange(0, BLOCK_D)
-            q_tile = tl.load(q_base + d_offsets).to(tl.float32)
-            k_tile = tl.load(
-                KV_ptr + kv_idx[:, None] * stride_kv_tok + d_offsets[None, :],
-                mask=mask_kv[:, None], other=0.0,
-            ).to(tl.float32)
-            scores += tl.sum(k_tile * q_tile[None, :], axis=1)
+        # --- Compute QK scores via dot_scaled ---
+        qk = tl.zeros([NUM_HEADS, BLOCK_N], dtype=tl.float32)
 
-        scores = scores * (kv_scale * sm_scale)
-        scores = tl.where(mask_kv, scores, float("-inf"))
+        for k_tile in tl.static_range(5):
+            k_packed_start = k_tile * 64   # 128/2 packed bytes per tile
+            k_scale_start = k_tile * 4     # 128/32 scale blocks per tile
 
-        m_new = tl.maximum(m_prev, tl.max(scores, axis=0))
+            # Q chunk: [16, 64] packed uint8
+            q_d_offs = k_packed_start + tl.arange(0, 64)
+            q_chunk = tl.load(
+                Q_packed_ptr + (q_row_base + offs_m[:, None]) * stride_q_packed + q_d_offs[None, :],
+                mask=(q_d_offs[None, :] < 288),
+                other=0,
+            )
+
+            # Q scale chunk: [16, 4] uint8 (e8m0)
+            qs_offs = k_scale_start + tl.arange(0, 4)
+            q_scale_chunk = tl.load(
+                Q_scale_ptr + (q_row_base + offs_m[:, None]) * stride_q_scale + qs_offs[None, :],
+                mask=(qs_offs[None, :] < 18),
+                other=0,
+            )
+
+            # K chunk TRANSPOSED: [64, BLOCK_N] packed uint8
+            k_d_offs = k_packed_start + tl.arange(0, 64)
+            k_chunk = tl.load(
+                K_packed_ptr + kv_idx[None, :] * stride_kv_packed + k_d_offs[:, None],
+                mask=mask_kv[None, :] & (k_d_offs[:, None] < 288),
+                other=0,
+            )
+
+            # K scale chunk: [BLOCK_N, 4] uint8 (e8m0)
+            ks_offs = k_scale_start + tl.arange(0, 4)
+            k_scale_chunk = tl.load(
+                K_scale_ptr + kv_idx[:, None] * stride_kv_scale + ks_offs[None, :],
+                mask=mask_kv[:, None] & (ks_offs[None, :] < 18),
+                other=0,
+            )
+
+            # dot_scaled: [16, 64] x [64, BLOCK_N] -> accumulate [16, BLOCK_N]
+            qk = tl.dot_scaled(
+                q_chunk, q_scale_chunk, "e2m1",
+                k_chunk, k_scale_chunk, "e2m1",
+                fast_math=True, acc=qk,
+            )
+
+        # Scale and mask
+        qk *= sm_scale
+        qk = tl.where(mask_kv[None, :], qk, float("-inf"))
+
+        # --- Online softmax ---
+        m_new = tl.maximum(m_prev, tl.max(qk, 1))
         alpha = tl.math.exp2((m_prev - m_new) * LOG2E)
-        p = tl.math.exp2((scores - m_new) * LOG2E)
-        p = tl.where(mask_kv, p, 0.0)
+        p = tl.math.exp2((qk - m_new[:, None]) * LOG2E)
+        p = tl.where(mask_kv[None, :], p, 0.0)
 
-        acc0 *= alpha; acc1 *= alpha; acc2 *= alpha; acc3 *= alpha
-        acc4 *= alpha; acc5 *= alpha; acc6 *= alpha; acc7 *= alpha
-        l_prev = l_prev * alpha + tl.sum(p, axis=0)
+        acc = acc * alpha[:, None]
+        l_prev = l_prev * alpha + tl.sum(p, 1)
         m_prev = m_new
 
-        for v_blk in tl.static_range(V_DIM // BLOCK_D):
-            vd_start = v_blk * BLOCK_D
-            vd_offsets = vd_start + tl.arange(0, BLOCK_D)
-            v_tile = tl.load(
-                KV_ptr + kv_idx[:, None] * stride_kv_tok + vd_offsets[None, :],
-                mask=mask_kv[:, None], other=0.0,
-            ).to(tl.float32)
-            weighted = tl.sum(p[:, None] * v_tile, axis=0)
-            if v_blk == 0: acc0 += weighted
-            elif v_blk == 1: acc1 += weighted
-            elif v_blk == 2: acc2 += weighted
-            elif v_blk == 3: acc3 += weighted
-            elif v_blk == 4: acc4 += weighted
-            elif v_blk == 5: acc5 += weighted
-            elif v_blk == 6: acc6 += weighted
-            elif v_blk == 7: acc7 += weighted
+        # --- Accumulate V: p[16, BLOCK_N] @ V[BLOCK_N, V_CHUNK_D] ---
+        vd_offsets = vd_start + tl.arange(0, V_CHUNK_D)
+        v_tile = tl.load(
+            V_bf16_ptr + kv_idx[:, None] * stride_v_tok + vd_offsets[None, :],
+            mask=mask_kv[:, None],
+            other=0.0,
+        )
+        acc += tl.dot(p.to(tl.bfloat16), v_tile, out_dtype=tl.float32)
 
-    # Apply kv_scale to V (deferred FP8 dequant)
-    acc0 *= kv_scale; acc1 *= kv_scale; acc2 *= kv_scale; acc3 *= kv_scale
-    acc4 *= kv_scale; acc5 *= kv_scale; acc6 *= kv_scale; acc7 *= kv_scale
+    # Store partial outputs
+    po_base = (Partial_O_ptr + pid_b * stride_po_b + pid_s * stride_po_s + vd_start)
+    head_offs = tl.arange(0, NUM_HEADS)
+    v_offs = tl.arange(0, V_CHUNK_D)
+    tl.store(
+        po_base + head_offs[:, None] * stride_po_h + v_offs[None, :],
+        acc,
+    )
 
-    po_base = Partial_O_ptr + pid_b * stride_po_b + pid_s * stride_po_s + pid_h * stride_po_h
-    d_off = tl.arange(0, BLOCK_D)
-    tl.store(po_base + 0 * BLOCK_D + d_off, acc0)
-    tl.store(po_base + 1 * BLOCK_D + d_off, acc1)
-    tl.store(po_base + 2 * BLOCK_D + d_off, acc2)
-    tl.store(po_base + 3 * BLOCK_D + d_off, acc3)
-    tl.store(po_base + 4 * BLOCK_D + d_off, acc4)
-    tl.store(po_base + 5 * BLOCK_D + d_off, acc5)
-    tl.store(po_base + 6 * BLOCK_D + d_off, acc6)
-    tl.store(po_base + 7 * BLOCK_D + d_off, acc7)
+    # Store m and l (only from v_chunk 0 to avoid redundant writes)
+    if pid_v == 0:
+        ml_base = pid_b * stride_ml_b + pid_s * stride_ml_s
+        tl.store(
+            Partial_m_ptr + ml_base + head_offs * stride_ml_h,
+            m_prev,
+        )
+        tl.store(
+            Partial_l_ptr + ml_base + head_offs * stride_ml_h,
+            l_prev,
+        )
 
-    ml_off = pid_b * stride_ml_b + pid_s * stride_ml_s + pid_h * stride_ml_h
-    tl.store(Partial_m_ptr + ml_off, m_prev)
-    tl.store(Partial_l_ptr + ml_off, l_prev)
 
+# ===============================================================
+# MXFP4 TRITON KERNEL -- STAGE 2: REDUCE
+# ===============================================================
 
 @triton.jit
-def _mla_reduce_fp8(
+def _mla_mxfp4_reduce(
     Partial_O_ptr, Partial_m_ptr, Partial_l_ptr, O_ptr,
     stride_po_b, stride_po_s, stride_po_h,
     stride_ml_b, stride_ml_s, stride_ml_h,
     stride_o_batch, stride_o_head,
     NUM_KV_SPLITS: tl.constexpr,
-    V_DIM: tl.constexpr,
+    V_CHUNK_D: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
 ):
-    """Stage 2: Reduce across splits."""
+    """Reduce across splits for one (batch, head, v_chunk)."""
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
+    pid_v = tl.program_id(2)
+    vd_start = pid_v * V_CHUNK_D
 
+    # Find global max across splits
     m_global = tl.full([], float("-inf"), dtype=tl.float32)
     for s in tl.static_range(NUM_KV_SPLITS):
         m_s = tl.load(Partial_m_ptr + pid_b * stride_ml_b + s * stride_ml_s + pid_h * stride_ml_h)
         m_global = tl.maximum(m_global, m_s)
 
+    # Rescale and accumulate
     l_global = tl.full([], 0.0, dtype=tl.float32)
-    acc = tl.zeros([V_DIM], dtype=tl.float32)
-    v_offsets = tl.arange(0, V_DIM)
+    acc = tl.zeros([V_CHUNK_D], dtype=tl.float32)
+    v_offsets = tl.arange(0, V_CHUNK_D)
 
     for s in tl.static_range(NUM_KV_SPLITS):
         m_s = tl.load(Partial_m_ptr + pid_b * stride_ml_b + s * stride_ml_s + pid_h * stride_ml_h)
         l_s = tl.load(Partial_l_ptr + pid_b * stride_ml_b + s * stride_ml_s + pid_h * stride_ml_h)
         rescale = tl.math.exp(m_s - m_global)
         l_global += l_s * rescale
-        po_base = Partial_O_ptr + pid_b * stride_po_b + s * stride_po_s + pid_h * stride_po_h
+
+        po_base = (Partial_O_ptr + pid_b * stride_po_b + s * stride_po_s
+                   + pid_h * stride_po_h + vd_start)
         partial = tl.load(po_base + v_offsets)
         acc += rescale * partial
 
     acc = acc / (l_global + 1e-10)
-    o_base = O_ptr + pid_b * stride_o_batch + pid_h * stride_o_head
+    o_base = O_ptr + pid_b * stride_o_batch + pid_h * stride_o_head + vd_start
     tl.store(o_base + v_offsets, acc.to(tl.bfloat16))
 
 
-def _triton_get_bufs(bs, num_splits, device):
-    key = (bs, num_splits)
-    if key not in _triton_buf_cache:
-        _triton_buf_cache[key] = {
-            "po": torch.empty((bs, num_splits, NUM_HEADS, V_HEAD_DIM), dtype=torch.float32, device=device),
-            "pm": torch.empty((bs, num_splits, NUM_HEADS), dtype=torch.float32, device=device),
-            "pl": torch.empty((bs, num_splits, NUM_HEADS), dtype=torch.float32, device=device),
-            "o": torch.empty((bs, NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16, device=device),
+# ===============================================================
+# MXFP4 BUFFER CACHE
+# ===============================================================
+
+def _mxfp4_get_buffers(batch_size, num_kv_splits, device):
+    key = (batch_size, num_kv_splits)
+    if key not in _mxfp4_buf_cache:
+        _mxfp4_buf_cache[key] = {
+            "partial_o": torch.empty(
+                (batch_size, num_kv_splits, NUM_HEADS, V_HEAD_DIM),
+                dtype=torch.float32, device=device,
+            ),
+            "partial_m": torch.empty(
+                (batch_size, num_kv_splits, NUM_HEADS),
+                dtype=torch.float32, device=device,
+            ),
+            "partial_l": torch.empty(
+                (batch_size, num_kv_splits, NUM_HEADS),
+                dtype=torch.float32, device=device,
+            ),
+            "output": torch.empty(
+                (batch_size, NUM_HEADS, V_HEAD_DIM),
+                dtype=torch.bfloat16, device=device,
+            ),
         }
-    return _triton_buf_cache[key]
+    return _mxfp4_buf_cache[key]
 
 
-def _triton_path(q, kv_data, kv_indptr, config):
-    """Bare Triton FP8 decode — zero AITER overhead, zero Q quant."""
-    kv_fp8, kv_scale = kv_data["fp8"]
-    bs = config["batch_size"]
-    kvlen = config["kv_seq_len"]
-    ns = TRITON_KV_SPLITS.get((bs, kvlen), 4)
+# ===============================================================
+# MXFP4 DECODE PATH
+# ===============================================================
 
-    kv_2d = kv_fp8.view(-1, QK_HEAD_DIM)
-    bufs = _triton_get_bufs(bs, ns, q.device)
+def _mxfp4_path(q, kv_data, kv_indptr, config):
+    """
+    MXFP4 MLA decode using hardware tl.dot_scaled on MI355X.
+    Q quantized to MXFP4, K via dot_scaled, V via bf16 tl.dot.
+    """
+    batch_size = config["batch_size"]
+    kv_seq_len = config["kv_seq_len"]
 
-    grid1 = (bs * ns, NUM_HEADS)
-    _mla_stage1_fp8[grid1](
-        q, kv_2d, kv_scale,
-        bufs["po"], bufs["pm"], bufs["pl"], kv_indptr,
-        q.stride(0), q.stride(1), kv_2d.stride(0),
-        bufs["po"].stride(0), bufs["po"].stride(1), bufs["po"].stride(2),
-        bufs["pm"].stride(0), bufs["pm"].stride(1), bufs["pm"].stride(2),
-        SM_SCALE, BLOCK_KV=64, BLOCK_D=64, NUM_KV_SPLITS=ns,
+    num_kv_splits = MXFP4_KV_SPLITS_MAP.get(
+        (batch_size, kv_seq_len), MXFP4_DEFAULT_KV_SPLITS
     )
 
-    grid2 = (bs, NUM_HEADS)
-    _mla_reduce_fp8[grid2](
-        bufs["po"], bufs["pm"], bufs["pl"], bufs["o"],
-        bufs["po"].stride(0), bufs["po"].stride(1), bufs["po"].stride(2),
-        bufs["pm"].stride(0), bufs["pm"].stride(1), bufs["pm"].stride(2),
-        bufs["o"].stride(0), bufs["o"].stride(1),
-        NUM_KV_SPLITS=ns, V_DIM=V_HEAD_DIM,
+    kv_fp4, kv_scale = kv_data["mxfp4"]
+    kv_bf16 = kv_data["bf16"]
+
+    # Quantize Q to MXFP4
+    q_2d = q.view(-1, QK_HEAD_DIM)  # (batch*16, 576)
+    q_packed_raw, q_scale_raw = dynamic_mxfp4_quant(q_2d)
+    # Cast to uint8 for Triton (dynamic_mxfp4_quant returns float4_e2m1fn_x2)
+    q_packed = q_packed_raw.view(torch.uint8)
+    q_scale = q_scale_raw.view(torch.uint8)
+
+    # Flatten KV tensors, cast to uint8 for Triton
+    kv_fp4_2d = kv_fp4.reshape(-1, PACKED_QK).view(torch.uint8)  # (total_kv, 288)
+    kv_scale_2d = kv_scale.view(torch.uint8) if kv_scale.dtype != torch.uint8 else kv_scale
+    v_bf16_2d = kv_bf16.view(-1, QK_HEAD_DIM)  # (total_kv, 576)
+
+    BLOCK_N = 64
+    V_CHUNK_D = 128
+    num_v_chunks = V_HEAD_DIM // V_CHUNK_D  # 512 / 128 = 4
+
+    bufs = _mxfp4_get_buffers(batch_size, num_kv_splits, q.device)
+
+    # Stage 1: one program per (batch*split, 1, v_chunk)
+    grid1 = (batch_size * num_kv_splits, 1, num_v_chunks)
+    _mla_mxfp4_stage1[grid1](
+        q_packed, q_scale,
+        kv_fp4_2d, kv_scale_2d,
+        v_bf16_2d,
+        bufs["partial_o"], bufs["partial_m"], bufs["partial_l"],
+        kv_indptr,
+        q_packed.stride(0), q_scale.stride(0),
+        kv_fp4_2d.stride(0), kv_scale_2d.stride(0),
+        v_bf16_2d.stride(0),
+        bufs["partial_o"].stride(0), bufs["partial_o"].stride(1), bufs["partial_o"].stride(2),
+        bufs["partial_m"].stride(0), bufs["partial_m"].stride(1), bufs["partial_m"].stride(2),
+        SM_SCALE,
+        BLOCK_N=BLOCK_N, V_CHUNK_D=V_CHUNK_D,
+        NUM_KV_SPLITS=num_kv_splits,
+        NUM_HEADS=NUM_HEADS,
     )
-    return bufs["o"]
+
+    # Stage 2: reduce across splits
+    grid2 = (batch_size, NUM_HEADS, num_v_chunks)
+    _mla_mxfp4_reduce[grid2](
+        bufs["partial_o"], bufs["partial_m"], bufs["partial_l"], bufs["output"],
+        bufs["partial_o"].stride(0), bufs["partial_o"].stride(1), bufs["partial_o"].stride(2),
+        bufs["partial_m"].stride(0), bufs["partial_m"].stride(1), bufs["partial_m"].stride(2),
+        bufs["output"].stride(0), bufs["output"].stride(1),
+        NUM_KV_SPLITS=num_kv_splits,
+        V_CHUNK_D=V_CHUNK_D,
+        NUM_HEADS=NUM_HEADS,
+    )
+
+    return bufs["output"]
 
 
-# ═══════════════════════════════════════════════════════════
-# AITER CACHED A8W8 PATH
-# ═══════════════════════════════════════════════════════════
+# ===============================================================
+# FP8 QUANTIZATION (for AITER path)
+# ===============================================================
+
+def quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    finfo = torch.finfo(FP8_DTYPE)
+    amax = tensor.abs().amax().clamp(min=1e-12)
+    scale = amax / finfo.max
+    fp8_tensor = (tensor / scale).clamp(min=finfo.min, max=finfo.max).to(FP8_DTYPE)
+    return fp8_tensor, scale.to(torch.float32).reshape(1)
+
+
+# ===============================================================
+# AITER CACHED METADATA
+# ===============================================================
 
 def _get_cached_meta(bs, nq, nkv, q_dtype, kv_dtype, qo_indptr, kv_indptr, num_kv_splits):
     key = (bs, num_kv_splits, q_dtype, kv_dtype)
@@ -306,11 +430,15 @@ def _get_cached_allocs(bs, nq, device):
     return _alloc_cache[key]
 
 
+# ===============================================================
+# AITER DECODE PATH
+# ===============================================================
+
 def _aiter_path(q, kv_data, qo_indptr, kv_indptr, config):
-    """AITER cached a8w8 path."""
+    """AITER cached a8w8 path for large configs."""
     bs = config["batch_size"]
     kvlen = config["kv_seq_len"]
-    num_kv_splits = KV_SPLITS_MAP.get((bs, kvlen), DEFAULT_KV_SPLITS)
+    num_kv_splits = AITER_KV_SPLITS_MAP.get((bs, kvlen), AITER_DEFAULT_KV_SPLITS)
 
     q_fp8, q_scale = quantize_fp8(q)
 
@@ -347,16 +475,16 @@ def _aiter_path(q, kv_data, qo_indptr, kv_indptr, config):
     return o
 
 
-# ═══════════════════════════════════════════════════════════
+# ===============================================================
 # ENTRY POINT
-# ═══════════════════════════════════════════════════════════
+# ===============================================================
 
 def custom_kernel(data: input_t) -> output_t:
     q, kv_data, qo_indptr, kv_indptr, config = data
     bs = config["batch_size"]
     kvlen = config["kv_seq_len"]
 
-    if (bs, kvlen) in TRITON_CONFIGS:
-        return _triton_path(q, kv_data, kv_indptr, config)
+    if (bs, kvlen) in MXFP4_CONFIGS:
+        return _mxfp4_path(q, kv_data, kv_indptr, config)
     else:
         return _aiter_path(q, kv_data, qo_indptr, kv_indptr, config)
