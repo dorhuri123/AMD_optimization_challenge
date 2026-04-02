@@ -57,10 +57,9 @@ hip_source = r"""
 #define BLOCK_N      16     // tokens per MFMA tile (matches MFMA N=16)
 #define MFMA_K       128    // K dimension of MFMA instruction
 #define NUM_QK_MFMA  5      // ceil(576/128) = 5 MFMA calls for QK
-// Define USE_MFMA_BUILTIN to use the compiler builtin instead of inline asm.
-// The builtin is preferred when the compiler supports it (ROCm 6.4+ with gfx950).
-// Comment out to use inline assembly fallback.
-#define USE_MFMA_BUILTIN 1
+// ROCm 7.1 on MI355X does NOT have the non-scaled MFMA builtin.
+// Use inline assembly instead (confirmed working from CK source analysis).
+// #define USE_MFMA_BUILTIN 1  // DISABLED — builtin not available
 
 #define FP8_LUT_SIZE 256
 
