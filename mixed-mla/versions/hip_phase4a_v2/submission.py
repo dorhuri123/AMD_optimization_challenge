@@ -609,10 +609,8 @@ torch::Tensor mla_hip_forward(
     dim3 grid_splitk(batch_size * num_kv_splits, 1);
     dim3 block_splitk(BLOCK_SIZE);  // 256 threads
 
-    // Use stream 0 (default) — popcorn runner blocks non-default streams
-    hipLaunchKernelGGL(
-        mla_decode_mfma_v2_splitk,
-        grid_splitk, block_splitk, smem_bytes, 0,
+    // Launch using CUDA-style syntax (maps to HIP on ROCm)
+    mla_decode_mfma_v2_splitk<<<grid_splitk, block_splitk, smem_bytes>>>(
         Q_float.data_ptr<float>(),
         (const unsigned char*)KV_bytes.data_ptr<int8_t>(),
         partial_acc.data_ptr<float>(),
@@ -633,9 +631,7 @@ torch::Tensor mla_hip_forward(
     dim3 grid_reduce(batch_size, num_heads);
     dim3 block_reduce(REDUCE_BLOCK);
 
-    hipLaunchKernelGGL(
-        mla_reduce,
-        grid_reduce, block_reduce, 0, 0,
+    mla_reduce<<<grid_reduce, block_reduce>>>(
         partial_acc.data_ptr<float>(),
         partial_max.data_ptr<float>(),
         partial_sum_exp.data_ptr<float>(),
