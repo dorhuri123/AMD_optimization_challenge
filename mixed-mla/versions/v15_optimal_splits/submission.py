@@ -34,11 +34,11 @@ KV_SPLITS_MAP = {
     (4, 1024): 16,    # was 16 (same)
     (4, 8192): 16,    # was 32 → 16
     (32, 1024): 8,    # was 16 → 8
-    (32, 8192): 8,    # was 48 → 8 (!!!)
-    (64, 1024): 4,    # was 16 → 4 (!!!)
-    (64, 8192): 4,    # was 24 → 4 (!!!)
-    (256, 1024): 1,   # was 16 → 1 (NO REDUCE!)
-    (256, 8192): 1,   # was 24 → 1 (NO REDUCE!)
+    (32, 8192): 8,    # was 48 → 8
+    (64, 1024): 4,    # was 16 → 4
+    (64, 8192): 4,    # was 24 → 4
+    (256, 1024): 4,   # was 16 → 4 (persistent needs min 4, not 1)
+    (256, 8192): 4,   # was 24 → 4 (persistent needs min 4, not 1)
 }
 DEFAULT_KV_SPLITS = 8
 
