@@ -45,7 +45,6 @@ NUM_KV_SPLITS: int = 16
 
 hip_source = r"""
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_runtime.h>
 
 // ---------------------------------------------------------------
@@ -675,10 +674,9 @@ torch::Tensor mla_hip_forward(
     dim3 grid_splitk(batch_size * num_kv_splits, 1);
     dim3 block_splitk(WARP_SIZE);  // 64 threads
 
-    hipStream_t stream = at::cuda::getCurrentCUDAStream();
     hipLaunchKernelGGL(
         mla_decode_mfma_splitk,
-        grid_splitk, block_splitk, smem_bytes, stream,
+        grid_splitk, block_splitk, smem_bytes, 0,
         Q_float.data_ptr<float>(),
         (const unsigned char*)KV_bytes.data_ptr<int8_t>(),
         partial_acc.data_ptr<float>(),
@@ -701,7 +699,7 @@ torch::Tensor mla_hip_forward(
 
     hipLaunchKernelGGL(
         mla_reduce,
-        grid_reduce, block_reduce, 0, stream,
+        grid_reduce, block_reduce, 0, 0,
         partial_acc.data_ptr<float>(),
         partial_max.data_ptr<float>(),
         partial_sum_exp.data_ptr<float>(),

@@ -1,103 +1,159 @@
 """
-v13 Combined Hybrid -- best-of-all routing for MI355X (gfx950)
+Phase 4a: MFMA-accelerated QK dot product for MLA decode on gfx950.
 
-Routing table (based on MI355X profiling data):
-- HIP kernel:      bs=4,kv=1024    (Phase 3.5 scalar FP8 dequant via LUT)
-- MXFP4 Triton:    bs=4,kv=8192 + bs=32,kv=1024 + bs=64,kv=1024
-                    (dot_scaled for QK, bf16 V)
-- AITER bypass:    bs=32,kv=8192 + bs=64,kv=8192
-                    (direct C++ calls, fused Q quant)
-- AITER wrapper:   bs=256,kv=1024 + bs=256,kv=8192
-                    (standard mla_decode_fwd, fused Q quant)
+Uses v_mfma_f32_16x16x128_f8f6f4 hardware instruction for the QK phase:
+- 5 MFMA calls cover 576 QK dims (5 x 128 = 640, last 64 padded)
+- Each MFMA computes: C[16x16] += A[16x128] * B[128x16]
+  where M=16 heads, K=128 dims, N=16 tokens
+- Scalar softmax + PV accumulation (same as Phase 3.5)
 
-Falls back gracefully if HIP compilation fails (routes to MXFP4 or AITER).
+Grid: (batch_size * num_kv_splits, 1)
+Block: 64 threads = 1 wave (minimal for MFMA)
+
+Register layout for v_mfma_f32_16x16x128_f8f6f4 (wave64):
+  A[M=16, K=128]: thread t holds A[t%16, (t/16)*32 : (t/16)*32+32] = 32 bytes = 8 int32
+  B[K=128, N=16]: thread t holds B[(t/16)*32 : (t/16)*32+32, t%16] = 32 bytes = 8 int32
+  C[M=16, N=16]:  thread t holds C[t%16, (t/16)*4 : (t/16)*4+4] = 4 float32
+
+gfx950 ONLY. Cannot test on MI300X.
 """
 
 import os
 os.environ["PYTORCH_ROCM_ARCH"] = "gfx950"
 
 import torch
-import triton
-import triton.language as tl
 from task import input_t, output_t
 
-# ===============================================================
+# ===================================================================
 # CONSTANTS
-# ===============================================================
+# ===================================================================
 
 NUM_HEADS: int = 16
 NUM_KV_HEADS: int = 1
 KV_LORA_RANK: int = 512
 QK_ROPE_HEAD_DIM: int = 64
-QK_HEAD_DIM: int = 576  # KV_LORA_RANK + QK_ROPE_HEAD_DIM
-V_HEAD_DIM: int = 512   # KV_LORA_RANK
+QK_HEAD_DIM: int = 576
+V_HEAD_DIM: int = 512
 SM_SCALE: float = 1.0 / (QK_HEAD_DIM ** 0.5)
 PAGE_SIZE: int = 1
 
-# MXFP4 K dim layout: 576 = 4*128 + 64 -> 5 tiles of 128 (last padded)
-PACKED_QK: int = 288       # 576 / 2 packed bytes
-NUM_SCALES: int = 18       # 576 / 32 scale blocks
-
-# ===============================================================
-# ROUTING CONFIGS
-# ===============================================================
-
-HIP_CONFIGS = {(4, 1024)}
-MXFP4_CONFIGS = {(4, 8192), (32, 1024), (64, 1024)}
-BYPASS_CONFIGS = {(32, 8192), (64, 8192)}
-WRAPPER_CONFIGS = {(256, 1024), (256, 8192)}
-
-# HIP split-K tuning
-HIP_NUM_KV_SPLITS = 16
-
-# MXFP4 split-K tuning
-MXFP4_KV_SPLITS_MAP = {
-    (4, 8192): 16,
-    (32, 1024): 4,
-    (64, 1024): 4,
-}
-MXFP4_DEFAULT_KV_SPLITS = 8
-
-# AITER split-K tuning (shared by bypass and wrapper paths)
-AITER_KV_SPLITS_MAP = {
-    (32, 8192): 48,
-    (64, 8192): 24,
-    (256, 1024): 16,
-    (256, 8192): 24,
-}
-AITER_DEFAULT_KV_SPLITS = 16
-
-# Caches
-_mxfp4_buf_cache: dict = {}
-_meta_cache: dict = {}
-_bypass_meta_cache: dict = {}
-_alloc_cache: dict = {}
-_fp8_buf_cache: dict = {}
-
+NUM_KV_SPLITS: int = 16
 
 # ===================================================================
-# SECTION 1: HIP KERNEL (Phase 3.5 scalar FP8 dequant via LUT)
+# HIP KERNEL SOURCE
 # ===================================================================
 
 hip_source = r"""
 #include <torch/extension.h>
 #include <hip/hip_runtime.h>
 
-#define QK_DIM 576
-#define V_DIM 512
-#define NUM_HEADS 16
-#define BLOCK_SIZE 256
-#define WARP_SIZE 64
-#define NUM_WARPS 4
-#define TOKENS_PER_ITER 8
-#define TOKENS_PER_WARP 2
-#define DIMS_PER_THREAD_V 2
-#define FP8_LUT_SIZE 256
-#define QK_DIMS_PER_THREAD 9
+// ---------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------
+#define QK_DIM       576
+#define V_DIM        512
+#define NUM_HEADS    16
+#define WARP_SIZE    64
+#define BLOCK_N      16     // tokens per MFMA tile (matches MFMA N=16)
+#define MFMA_K       128    // K dimension of MFMA instruction
+#define NUM_QK_MFMA  5      // ceil(576/128) = 5 MFMA calls for QK
+// Define USE_MFMA_BUILTIN to use the compiler builtin instead of inline asm.
+// The builtin is preferred when the compiler supports it (ROCm 6.4+ with gfx950).
+// Comment out to use inline assembly fallback.
+#define USE_MFMA_BUILTIN 1
 
-__device__ __forceinline__ float compute_fp8_value(unsigned char val) {
-    if (val == 0) return 0.0f;
-    if (val == 0x80) return 0.0f;
+#define FP8_LUT_SIZE 256
+
+// For the 256-thread reduce kernel
+#define REDUCE_BLOCK 256
+
+// ---------------------------------------------------------------
+// MFMA type definitions
+// ---------------------------------------------------------------
+// int8_vec: 8 x int32 = 32 bytes = 128 FP8 elements per thread
+// float4_vec: 4 x float32 = MFMA accumulator per thread
+typedef int    int8_vec   __attribute__((ext_vector_type(8)));
+typedef float  float4_vec __attribute__((ext_vector_type(4)));
+
+// ---------------------------------------------------------------
+// MFMA instruction wrapper
+// Computes: C[16x16] += A[16x128] * B[128x16] in FP8
+// cbsz=0: A is FP8 E4M3, blgp=0: B is FP8 E4M3
+//
+// Try builtin first; if it fails at compile time, the inline asm
+// fallback (mfma_f32_16x16x128_fp8) is used instead.
+// ---------------------------------------------------------------
+
+// Method 1: Compiler builtin (available in ROCm 6.4+ targeting gfx950)
+// No forward declaration needed -- the compiler recognizes __builtin_* names
+
+// Method 2: Inline assembly fallback
+// The v_mfma_f32_16x16x128_f8f6f4 instruction:
+//   dst/srcC: 4 VGPRs (float4), srcA: 8 VGPRs (int8), srcB: 8 VGPRs (int8)
+//   cbsz and blgp are immediates in the instruction word.
+//
+// With ext_vector_type, the inline asm constraint "v" on a vector type
+// automatically allocates the correct number of consecutive VGPRs.
+// %0 = v[dst:dst+3], %1 = v[a:a+7], %2 = v[b:b+7]
+__device__ __forceinline__ float4_vec mfma_f32_16x16x128_fp8_asm(
+    int8_vec a, int8_vec b, float4_vec c
+) {
+    float4_vec result = c;
+    asm volatile(
+        "v_mfma_f32_16x16x128_f8f6f4 %0, %1, %2, %0 cbsz:0 blgp:0"
+        : "+v"(result)
+        : "v"(a), "v"(b)
+    );
+    return result;
+}
+
+// ---------------------------------------------------------------
+// FP32 -> FP8 E4M3FNUZ conversion (software)
+// Matches the FNUZ format used in ROCm: no negative zero, no inf/nan
+// ---------------------------------------------------------------
+__device__ __forceinline__ unsigned char fp32_to_fp8_e4m3fnuz(float val) {
+    if (val == 0.0f) return 0;
+
+    unsigned int bits = __float_as_uint(val);
+    unsigned int sign = (bits >> 31) & 1;
+    int exponent = ((bits >> 23) & 0xFF) - 127;  // unbiased
+    unsigned int mantissa = bits & 0x7FFFFF;  // 23-bit
+
+    // FP8 E4M3 FNUZ: bias=8, exp range [-7, 7], max = 240
+    int fp8_exp = exponent + 8;  // re-bias to FP8
+
+    if (fp8_exp >= 15) {
+        // Clamp to max normal: sign | exp=14 | mant=7 -> +-240
+        return (sign << 7) | (14 << 3) | 7;
+    }
+    if (fp8_exp <= 0) {
+        // Subnormal or zero
+        if (fp8_exp < -3) return 0;  // too small
+        // Subnormal: shift mantissa right
+        unsigned int fp8_mant = (0x800000 | mantissa) >> (1 - fp8_exp + 20);
+        fp8_mant &= 0x7;
+        if (fp8_mant == 0) return 0;
+        return (sign << 7) | fp8_mant;
+    }
+
+    // Normal: round mantissa from 23 bits to 3 bits
+    unsigned int fp8_mant = (mantissa + (1 << 19)) >> 20;  // round to nearest
+    if (fp8_mant > 7) {
+        fp8_mant = 0;
+        fp8_exp += 1;
+        if (fp8_exp >= 15) {
+            return (sign << 7) | (14 << 3) | 7;
+        }
+    }
+
+    return (sign << 7) | (fp8_exp << 3) | fp8_mant;
+}
+
+// ---------------------------------------------------------------
+// FP8 E4M3FNUZ -> FP32 conversion (for scalar dequant in PV phase)
+// ---------------------------------------------------------------
+__device__ __forceinline__ float fp8_e4m3fnuz_to_fp32(unsigned char val) {
+    if (val == 0 || val == 0x80) return 0.0f;
 
     int sign = (val >> 7) & 1;
     int exp_bits = (val >> 3) & 0xF;
@@ -117,6 +173,18 @@ __device__ __forceinline__ float compute_fp8_value(unsigned char val) {
     return sign ? -result : result;
 }
 
+// ---------------------------------------------------------------
+// Build FP8 LUT in shared memory (256 entries)
+// ---------------------------------------------------------------
+__device__ void build_fp8_lut(float* lut, int tid, int nthreads) {
+    for (int i = tid; i < FP8_LUT_SIZE; i += nthreads) {
+        lut[i] = fp8_e4m3fnuz_to_fp32((unsigned char)i);
+    }
+}
+
+// ---------------------------------------------------------------
+// Warp-level reduction (sum) using shuffle -- AMD wavefront=64
+// ---------------------------------------------------------------
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 32; offset >= 1; offset >>= 1) {
@@ -125,162 +193,387 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-__global__ void mla_decode_splitk(
-    const float* __restrict__ Q,
-    const unsigned char* __restrict__ KV,
-    float* __restrict__ partial_acc,
-    float* __restrict__ partial_max,
-    float* __restrict__ partial_sum_exp,
-    const int* __restrict__ kv_indptr,
-    float combined_scale,
+// ---------------------------------------------------------------
+// Warp-level reduction (max) using shuffle
+// ---------------------------------------------------------------
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    #pragma unroll
+    for (int offset = 32; offset >= 1; offset >>= 1) {
+        val = fmaxf(val, __shfl_xor(val, offset));
+    }
+    return val;
+}
+
+
+// ---------------------------------------------------------------
+// Phase 4a: MFMA QK + Scalar PV Split-K kernel
+//
+// Grid:  (batch_size * num_kv_splits, 1)
+// Block: 64 threads = 1 wave
+//
+// One wave handles ALL 16 heads via the MFMA M=16 dimension.
+// Processes BLOCK_N=16 KV tokens per iteration.
+//
+// Shared memory layout:
+//   [0..255]           : FP8 LUT (256 floats = 1024 bytes)
+//   [256..9471]        : Q as FP8: 16 heads x 576 dims = 9216 bytes
+//                        stored as bytes at float offset 256
+//   [256+2304..?]      : KV tile: 16 tokens x 576 dims = 9216 bytes
+//   [scores area]      : 16x16 float scores = 256 floats = 1024 bytes
+//   Total: ~20KB
+// ---------------------------------------------------------------
+
+// Shared memory byte offsets
+#define SMEM_LUT_FLOATS   256
+#define SMEM_Q_FP8_OFFSET (SMEM_LUT_FLOATS * 4)                    // 1024 bytes
+#define SMEM_Q_FP8_SIZE   (NUM_HEADS * QK_DIM)                     // 9216 bytes
+#define SMEM_KV_OFFSET    (SMEM_Q_FP8_OFFSET + SMEM_Q_FP8_SIZE)   // 10240
+// Align KV to 16 bytes
+#define SMEM_KV_ALIGNED   ((SMEM_KV_OFFSET + 15) & ~15)            // 10240 (already aligned)
+#define SMEM_KV_SIZE      (BLOCK_N * QK_DIM)                       // 9216 bytes
+#define SMEM_SCORES_OFFSET (SMEM_KV_ALIGNED + SMEM_KV_SIZE)        // 19456
+#define SMEM_SCORES_SIZE   (NUM_HEADS * BLOCK_N * 4)               // 1024 bytes (256 floats)
+#define SMEM_QSCALE_OFFSET (SMEM_SCORES_OFFSET + SMEM_SCORES_SIZE) // after scores
+#define SMEM_QSCALE_SIZE   4                                       // 1 float = 4 bytes
+#define TOTAL_SMEM_BYTES   (SMEM_QSCALE_OFFSET + SMEM_QSCALE_SIZE + 16) // ~20.5KB + padding
+
+
+__global__ __launch_bounds__(64)
+void mla_decode_mfma_splitk(
+    const float* __restrict__ Q,             // [batch*16, 576] FP32
+    const unsigned char* __restrict__ KV,    // [total_kv, 576] FP8
+    float* __restrict__ partial_acc,         // [batch * num_splits * 16, V_DIM]
+    float* __restrict__ partial_max,         // [batch * num_splits * 16]
+    float* __restrict__ partial_sum_exp,     // [batch * num_splits * 16]
+    const int* __restrict__ kv_indptr,       // [batch+1]
+    float sm_scale,
+    float kv_scale,
     int num_kv_splits
 ) {
     int batch_split = blockIdx.x;
-    int head = blockIdx.y;
-
     int batch = batch_split / num_kv_splits;
     int split = batch_split % num_kv_splits;
 
-    int tid = threadIdx.x;
-    int warp_id = tid / WARP_SIZE;
-    int lane = tid % WARP_SIZE;
+    int tid = threadIdx.x;  // 0..63 (one wave)
+    int lane = tid;
 
+    // MFMA lane mapping
+    int lane_row = lane % 16;     // which head (for A) / which token col (for B) / which C row
+    int lane_kgrp = lane / 16;    // which K-group (0..3), each covers 32 K elements
+
+    // KV range for this batch
     int kv_start_all = kv_indptr[batch];
     int kv_end_all = kv_indptr[batch + 1];
     int total_kv = kv_end_all - kv_start_all;
 
+    // Split range
     int tokens_per_split = (total_kv + num_kv_splits - 1) / num_kv_splits;
     int kv_start = kv_start_all + split * tokens_per_split;
     int kv_end = kv_start_all + min((split + 1) * tokens_per_split, total_kv);
 
-    if (kv_start >= kv_end_all) {
-        int partial_idx = (batch * num_kv_splits + split) * NUM_HEADS + head;
-        partial_max[partial_idx] = -1e30f;
-        partial_sum_exp[partial_idx] = 0.0f;
-        float* p_acc = partial_acc + (long long)partial_idx * V_DIM;
-        for (int i = tid; i < V_DIM; i += BLOCK_SIZE) {
-            p_acc[i] = 0.0f;
+    // Handle empty split
+    if (kv_start >= kv_end_all || kv_start >= kv_end) {
+        // Write zeros for all heads
+        for (int h = 0; h < NUM_HEADS; h++) {
+            int partial_idx = (batch * num_kv_splits + split) * NUM_HEADS + h;
+            partial_max[partial_idx] = -1e30f;
+            partial_sum_exp[partial_idx] = 0.0f;
+            float* p_acc = partial_acc + (long long)partial_idx * V_DIM;
+            for (int i = tid; i < V_DIM; i += WARP_SIZE) {
+                p_acc[i] = 0.0f;
+            }
         }
         return;
     }
     if (kv_end > kv_end_all) kv_end = kv_end_all;
-
-    extern __shared__ float smem[];
-    float* lut = smem;
-    float* smem_q = smem + FP8_LUT_SIZE;
-    float* smem_scores = smem_q + QK_DIM;
-
-    lut[tid] = compute_fp8_value((unsigned char)tid);
-    __syncthreads();
-
-    const float* q_ptr = Q + ((long long)batch * NUM_HEADS + head) * QK_DIM;
-    for (int i = tid; i < QK_DIM; i += BLOCK_SIZE) {
-        smem_q[i] = q_ptr[i];
-    }
-    __syncthreads();
-
-    float q_regs[QK_DIMS_PER_THREAD];
-    #pragma unroll
-    for (int r = 0; r < QK_DIMS_PER_THREAD; r++) {
-        int d = lane + r * WARP_SIZE;
-        q_regs[r] = (d < QK_DIM) ? smem_q[d] : 0.0f;
-    }
-
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    int v_idx0 = tid * DIMS_PER_THREAD_V;
-    int v_idx1 = tid * DIMS_PER_THREAD_V + 1;
-
-    float block_max = -1e30f;
-    float block_sum_exp = 0.0f;
-
     int num_tokens = kv_end - kv_start;
 
-    for (int t_base = 0; t_base < num_tokens; t_base += TOKENS_PER_ITER) {
-        int tokens_this_iter = min(TOKENS_PER_ITER, num_tokens - t_base);
+    // Shared memory (raw bytes)
+    extern __shared__ char smem_raw[];
+    float* lut = (float*)smem_raw;                                // 256 floats at offset 0
+    unsigned char* smem_q_fp8 = (unsigned char*)(smem_raw + SMEM_Q_FP8_OFFSET);
+    unsigned char* smem_kv = (unsigned char*)(smem_raw + SMEM_KV_ALIGNED);
+    float* smem_scores = (float*)(smem_raw + SMEM_SCORES_OFFSET);
+    float* smem_q_scale = (float*)(smem_raw + SMEM_QSCALE_OFFSET);
 
+    // Step 1: Build FP8 LUT (64 threads, 4 iterations each)
+    for (int i = tid; i < FP8_LUT_SIZE; i += WARP_SIZE) {
+        lut[i] = fp8_e4m3fnuz_to_fp32((unsigned char)i);
+    }
+
+    // Step 2: Compute Q scale and convert Q from FP32 to scaled FP8
+    // Find max |Q| across all heads and dims, then scale Q to fit in FP8 range.
+    // FP8 E4M3FNUZ max = 240.0
+    const float FP8_MAX = 240.0f;
+    const float* q_base = Q + (long long)batch * NUM_HEADS * QK_DIM;
+
+    // Each thread finds local max across its assigned elements
+    float local_amax = 0.0f;
+    for (int i = tid; i < NUM_HEADS * QK_DIM; i += WARP_SIZE) {
+        float v = fabsf(q_base[i]);
+        local_amax = fmaxf(local_amax, v);
+    }
+    // Warp reduce to find global max
+    local_amax = warp_reduce_max(local_amax);
+
+    // Compute scale: q_scale = amax / FP8_MAX (so Q_fp8 = Q / q_scale fits in [-240, 240])
+    float q_scale_val;
+    if (tid == 0) {
+        q_scale_val = (local_amax > 1e-12f) ? (local_amax / FP8_MAX) : 1.0f;
+        smem_q_scale[0] = q_scale_val;
+    }
+    // All threads in the wave see the same value from warp_reduce_max, so:
+    q_scale_val = (local_amax > 1e-12f) ? (local_amax / FP8_MAX) : 1.0f;
+    float q_scale_inv = 1.0f / q_scale_val;
+
+    // Convert Q to FP8 with scaling
+    for (int i = tid; i < NUM_HEADS * QK_DIM; i += WARP_SIZE) {
+        smem_q_fp8[i] = fp32_to_fp8_e4m3fnuz(q_base[i] * q_scale_inv);
+    }
+
+    __syncthreads();
+
+    // Per-head V accumulators: each thread handles 8 V dims across all 16 heads.
+    // 64 threads x 8 dims = 512 = V_DIM.
+    // Per thread: 16 heads x 8 V accumulators = 128 floats + 32 softmax state = 160 VGPRs.
+    // gfx950 has 512 VGPRs per wave, so this fits.
+    #define V_DIMS_PER_THREAD 8
+    float v_acc[NUM_HEADS][V_DIMS_PER_THREAD];
+    float head_max[NUM_HEADS];
+    float head_sum_exp[NUM_HEADS];
+
+    #pragma unroll
+    for (int h = 0; h < NUM_HEADS; h++) {
+        head_max[h] = -1e30f;
+        head_sum_exp[h] = 0.0f;
         #pragma unroll
-        for (int w_tok = 0; w_tok < TOKENS_PER_WARP; w_tok++) {
-            int tok_idx = warp_id * TOKENS_PER_WARP + w_tok;
-            if (tok_idx < tokens_this_iter) {
-                int kv_idx = kv_start + t_base + tok_idx;
-                const unsigned char* kv_row = KV + (long long)kv_idx * QK_DIM;
+        for (int d = 0; d < V_DIMS_PER_THREAD; d++) {
+            v_acc[h][d] = 0.0f;
+        }
+    }
 
-                float partial_dot = 0.0f;
+    // V dim assignments for this thread
+    int v_base = tid * V_DIMS_PER_THREAD;  // 0, 8, 16, ..., 504
 
-                #pragma unroll
-                for (int r = 0; r < 8; r++) {
-                    int d = lane + r * WARP_SIZE;
-                    partial_dot += q_regs[r] * lut[kv_row[d]];
-                }
-                {
-                    int d = lane + 8 * WARP_SIZE;
-                    if (d < QK_DIM) {
-                        partial_dot += q_regs[8] * lut[kv_row[d]];
+    // ===================================================================
+    // Main loop: process BLOCK_N=16 KV tokens per iteration
+    // ===================================================================
+    for (int t_base = 0; t_base < num_tokens; t_base += BLOCK_N) {
+        int tokens_this_iter = min(BLOCK_N, num_tokens - t_base);
+
+        // --- Load KV tile into shared memory ---
+        // KV[kv_start + t_base + token, dim] -> smem_kv[token * QK_DIM + dim]
+        // Total: tokens_this_iter * 576 bytes. 64 threads cooperative load.
+        int total_bytes = tokens_this_iter * QK_DIM;
+        for (int i = tid; i < total_bytes; i += WARP_SIZE) {
+            int kv_idx = kv_start + t_base + i / QK_DIM;
+            int dim = i % QK_DIM;
+            smem_kv[i] = KV[(long long)kv_idx * QK_DIM + dim];
+        }
+
+        // Zero-pad remaining token slots if tokens_this_iter < BLOCK_N
+        if (tokens_this_iter < BLOCK_N) {
+            int pad_start = tokens_this_iter * QK_DIM;
+            int pad_end = BLOCK_N * QK_DIM;
+            for (int i = pad_start + tid; i < pad_end; i += WARP_SIZE) {
+                smem_kv[i] = 0;
+            }
+        }
+
+        __syncthreads();
+
+        // --- QK Phase: 5 MFMAs ---
+        // C[16 heads, 16 tokens] += Q_fp8[16, 128] * K_fp8[128, 16]
+        float4_vec qk_acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        for (int mfma_idx = 0; mfma_idx < NUM_QK_MFMA; mfma_idx++) {
+            int k_offset = mfma_idx * MFMA_K;  // 0, 128, 256, 384, 512
+
+            // Load A operand (Q data) into int8_vec register
+            // Thread tid (lane) needs Q[lane_row, k_offset + lane_kgrp*32 .. +32]
+            // = smem_q_fp8[lane_row * QK_DIM + k_offset + lane_kgrp * 32 + 0..31]
+            int8_vec a_reg;
+            {
+                int q_byte_base = lane_row * QK_DIM + k_offset + lane_kgrp * 32;
+                // Load 32 bytes (8 x int32) from smem_q_fp8
+                // Each int32 packs 4 FP8 bytes
+                const unsigned char* q_src = smem_q_fp8 + q_byte_base;
+                // Handle out-of-bounds (dim >= 576 in the last MFMA)
+                if (k_offset + lane_kgrp * 32 + 31 < QK_DIM) {
+                    // All 32 bytes are valid
+                    #pragma unroll
+                    for (int r = 0; r < 8; r++) {
+                        unsigned int packed = 0;
+                        packed |= (unsigned int)q_src[r * 4 + 0];
+                        packed |= (unsigned int)q_src[r * 4 + 1] << 8;
+                        packed |= (unsigned int)q_src[r * 4 + 2] << 16;
+                        packed |= (unsigned int)q_src[r * 4 + 3] << 24;
+                        a_reg[r] = (int)packed;
+                    }
+                } else {
+                    // Partial -- zero-pad bytes beyond QK_DIM
+                    #pragma unroll
+                    for (int r = 0; r < 8; r++) {
+                        unsigned int packed = 0;
+                        #pragma unroll
+                        for (int b = 0; b < 4; b++) {
+                            int dim = k_offset + lane_kgrp * 32 + r * 4 + b;
+                            if (dim < QK_DIM) {
+                                packed |= (unsigned int)smem_q_fp8[lane_row * QK_DIM + dim] << (b * 8);
+                            }
+                        }
+                        a_reg[r] = (int)packed;
                     }
                 }
+            }
 
-                float score = warp_reduce_sum(partial_dot);
-
-                if (lane == 0) {
-                    smem_scores[tok_idx] = score * combined_scale;
+            // Load B operand (K data, transposed) into int8_vec register
+            // For B[K=128, N=16]: thread tid needs K[(lane_kgrp*32)..+32, lane_row]
+            // In memory, K is stored as KV[token, dim], so K transposed has:
+            //   B[k, n] = KV[token_n, k_offset + k]
+            // Thread tid needs: KV[token = lane_row, dim = k_offset + lane_kgrp*32..+32]
+            // = smem_kv[lane_row * QK_DIM + k_offset + lane_kgrp * 32 + 0..31]
+            //
+            // NOTE: For B operand, the data layout is column-major over N.
+            // B[k, col] where col = lane_row (0..15), k_group = lane_kgrp (0..3)
+            // thread holds 32 consecutive K elements for one column (token).
+            int8_vec b_reg;
+            {
+                int kv_byte_base = lane_row * QK_DIM + k_offset + lane_kgrp * 32;
+                const unsigned char* kv_src = smem_kv + kv_byte_base;
+                if (k_offset + lane_kgrp * 32 + 31 < QK_DIM) {
+                    #pragma unroll
+                    for (int r = 0; r < 8; r++) {
+                        unsigned int packed = 0;
+                        packed |= (unsigned int)kv_src[r * 4 + 0];
+                        packed |= (unsigned int)kv_src[r * 4 + 1] << 8;
+                        packed |= (unsigned int)kv_src[r * 4 + 2] << 16;
+                        packed |= (unsigned int)kv_src[r * 4 + 3] << 24;
+                        b_reg[r] = (int)packed;
+                    }
+                } else {
+                    #pragma unroll
+                    for (int r = 0; r < 8; r++) {
+                        unsigned int packed = 0;
+                        #pragma unroll
+                        for (int b = 0; b < 4; b++) {
+                            int dim = k_offset + lane_kgrp * 32 + r * 4 + b;
+                            if (dim < QK_DIM) {
+                                packed |= (unsigned int)smem_kv[lane_row * QK_DIM + dim] << (b * 8);
+                            }
+                        }
+                        b_reg[r] = (int)packed;
+                    }
                 }
             }
+
+            // Execute MFMA: C[16, 16] += A[16, 128] * B[128, 16]
+#ifdef USE_MFMA_BUILTIN
+            qk_acc = __builtin_amdgcn_mfma_f32_16x16x128_f8f6f4(
+                a_reg, b_reg, qk_acc,
+                0,  // cbsz=0: FP8 E4M3 for A
+                0   // blgp=0: FP8 E4M3 for B
+            );
+#else
+            qk_acc = mfma_f32_16x16x128_fp8_asm(a_reg, b_reg, qk_acc);
+#endif
         }
+
+        // --- Extract QK scores to shared memory ---
+        // After MFMA: thread tid holds C[lane_row, lane_kgrp*4 : lane_kgrp*4+4]
+        // = scores[head=lane_row, tokens=lane_kgrp*4..lane_kgrp*4+3]
+        // Need to store as smem_scores[head][token]
+        //
+        // Apply combined scale: q_scale * kv_scale * sm_scale
+        // The MFMA computes: sum(dequant(Q_fp8[h,k]) * dequant(K_fp8[t,k]))
+        // Q_fp8 was quantized as: Q_fp8 = fp8(Q_f32 / q_scale_val)
+        // So dequant(Q_fp8) ~= Q_f32 / q_scale_val
+        // K_fp8 is the original FP8 data, dequant(K_fp8) ~= K_original / kv_scale? No.
+        // K_fp8 IS the stored KV cache. dequant(K_fp8) gives the FP8 numeric value.
+        // The actual K value is: K_actual = dequant(K_fp8) * kv_scale.
+        // So MFMA result = sum((Q_f32/q_scale) * dequant(K_fp8))
+        // True score = sum(Q_f32 * K_actual) = sum(Q_f32 * dequant(K_fp8) * kv_scale)
+        // Therefore: true_score = MFMA_result * q_scale_val * kv_scale
+        // Final attention score = true_score * sm_scale
+        float combined_scale = q_scale_val * kv_scale * sm_scale;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int token_idx = lane_kgrp * 4 + i;
+            int head_idx = lane_row;
+            smem_scores[head_idx * BLOCK_N + token_idx] = qk_acc[i] * combined_scale;
+        }
+
         __syncthreads();
 
-        float tile_max = -1e30f;
-        #pragma unroll
-        for (int t = 0; t < TOKENS_PER_ITER; t++) {
-            if (t < tokens_this_iter) {
-                tile_max = fmaxf(tile_max, smem_scores[t]);
+        // --- Online softmax + V accumulation (scalar, per head) ---
+        // All 64 threads participate. Each thread handles 8 V dims across all 16 heads.
+        #pragma unroll 1
+        for (int h = 0; h < NUM_HEADS; h++) {
+            // Find max score for this head across tokens_this_iter tokens
+            float tile_max = -1e30f;
+            for (int t = 0; t < tokens_this_iter; t++) {
+                tile_max = fmaxf(tile_max, smem_scores[h * BLOCK_N + t]);
+            }
+
+            float new_max = fmaxf(head_max[h], tile_max);
+
+            // Rescale existing accumulator
+            float rescale = expf(head_max[h] - new_max);
+            #pragma unroll
+            for (int d = 0; d < V_DIMS_PER_THREAD; d++) {
+                v_acc[h][d] *= rescale;
+            }
+            head_sum_exp[h] *= rescale;
+            head_max[h] = new_max;
+
+            // Accumulate V weighted by softmax
+            for (int t = 0; t < tokens_this_iter; t++) {
+                float w = expf(smem_scores[h * BLOCK_N + t] - new_max);
+                head_sum_exp[h] += w;
+
+                // Read V from shared memory (already loaded for QK phase)
+                const unsigned char* kv_smem_row = &smem_kv[t * QK_DIM];
+
+                #pragma unroll
+                for (int d = 0; d < V_DIMS_PER_THREAD; d++) {
+                    int v_dim = v_base + d;
+                    if (v_dim < V_DIM) {
+                        v_acc[h][d] += w * lut[kv_smem_row[v_dim]];
+                    }
+                }
             }
         }
 
-        float new_max = fmaxf(block_max, tile_max);
-
-        float rescale = expf(block_max - new_max);
-        acc0 *= rescale;
-        acc1 *= rescale;
-        block_sum_exp *= rescale;
-        block_max = new_max;
-
-        #pragma unroll
-        for (int t = 0; t < TOKENS_PER_ITER; t++) {
-            if (t < tokens_this_iter) {
-                float w = expf(smem_scores[t] - block_max);
-                block_sum_exp += w;
-
-                int kv_idx = kv_start + t_base + t;
-                const unsigned char* kv_row = KV + (long long)kv_idx * QK_DIM;
-
-                if (v_idx0 < V_DIM) {
-                    acc0 += w * lut[kv_row[v_idx0]];
-                }
-                if (v_idx1 < V_DIM) {
-                    acc1 += w * lut[kv_row[v_idx1]];
-                }
-            }
-        }
         __syncthreads();
     }
 
-    int partial_idx = (batch * num_kv_splits + split) * NUM_HEADS + head;
-    float* p_acc = partial_acc + (long long)partial_idx * V_DIM;
+    // --- Write partial results for all heads ---
+    for (int h = 0; h < NUM_HEADS; h++) {
+        int partial_idx = (batch * num_kv_splits + split) * NUM_HEADS + h;
+        float* p_acc = partial_acc + (long long)partial_idx * V_DIM;
 
-    if (v_idx0 < V_DIM) {
-        p_acc[v_idx0] = acc0;
-    }
-    if (v_idx1 < V_DIM) {
-        p_acc[v_idx1] = acc1;
-    }
+        #pragma unroll
+        for (int d = 0; d < V_DIMS_PER_THREAD; d++) {
+            int v_dim = v_base + d;
+            if (v_dim < V_DIM) {
+                p_acc[v_dim] = v_acc[h][d];
+            }
+        }
 
-    if (tid == 0) {
-        partial_max[partial_idx] = block_max;
-        partial_sum_exp[partial_idx] = block_sum_exp;
+        if (tid == 0) {
+            partial_max[partial_idx] = head_max[h];
+            partial_sum_exp[partial_idx] = head_sum_exp[h];
+        }
     }
 }
 
+
+// ---------------------------------------------------------------
+// Reduce kernel: merge partial results across splits
+// Grid: (batch_size, NUM_HEADS)
+// Block: 256 threads
+// ---------------------------------------------------------------
 __global__ void mla_reduce(
     const float* __restrict__ partial_acc,
     const float* __restrict__ partial_max,
@@ -293,6 +586,7 @@ __global__ void mla_reduce(
     int head = blockIdx.y;
     int tid = threadIdx.x;
 
+    // Find global max across all splits
     float global_max = -1e30f;
     for (int s = 0; s < num_kv_splits; s++) {
         int idx = (batch * num_kv_splits + s) * NUM_HEADS + head;
@@ -300,6 +594,8 @@ __global__ void mla_reduce(
         global_max = fmaxf(global_max, m);
     }
 
+    // Compute global sum of exp and rescaled V accumulator
+    // Each thread handles 2 V dims (256 threads * 2 = 512)
     float global_sum_exp = 0.0f;
     float final_v0 = 0.0f;
     float final_v1 = 0.0f;
@@ -324,6 +620,10 @@ __global__ void mla_reduce(
         }
     }
 
+    // Normalize
+    // Note: kv_scale is already applied in the splitk kernel via combined_scale.
+    // The V values from the LUT are already in dequantized FP8 scale.
+    // We need to apply kv_scale to V values here.
     float inv_sum = (global_sum_exp > 0.0f) ? (1.0f / global_sum_exp) : 0.0f;
     float* out_row = output + ((long long)batch * NUM_HEADS + head) * V_DIM;
 
@@ -335,6 +635,10 @@ __global__ void mla_reduce(
     }
 }
 
+
+// ---------------------------------------------------------------
+// Torch C++ wrapper
+// ---------------------------------------------------------------
 torch::Tensor mla_hip_forward(
     torch::Tensor Q,
     torch::Tensor KV_fp8,
@@ -348,9 +652,13 @@ torch::Tensor mla_hip_forward(
     const int v_dim = V_DIM;
     const int num_heads = NUM_HEADS;
 
+    // Q: bf16 -> float, reshape to [batch*16, 576]
     auto Q_float = Q.to(torch::kFloat32).contiguous().view({-1, qk_dim});
+
+    // KV bytes
     auto KV_bytes = KV_fp8.contiguous().view({-1, qk_dim});
 
+    // Allocate partial results
     int num_partials = batch_size * num_kv_splits * num_heads;
     auto partial_acc = torch::zeros({num_partials, v_dim},
                                      torch::dtype(torch::kFloat32).device(Q.device()));
@@ -359,13 +667,15 @@ torch::Tensor mla_hip_forward(
     auto partial_sum_exp = torch::zeros({num_partials},
                                          torch::dtype(torch::kFloat32).device(Q.device()));
 
-    int smem_bytes = (FP8_LUT_SIZE + QK_DIM + TOKENS_PER_ITER) * sizeof(float);
+    // Shared memory
+    int smem_bytes = TOTAL_SMEM_BYTES;
 
-    dim3 grid_splitk(batch_size * num_kv_splits, num_heads);
-    dim3 block_splitk(BLOCK_SIZE);
+    // Launch split-K MFMA kernel: 1 wave per (batch, split)
+    dim3 grid_splitk(batch_size * num_kv_splits, 1);
+    dim3 block_splitk(WARP_SIZE);  // 64 threads
 
     hipLaunchKernelGGL(
-        mla_decode_splitk,
+        mla_decode_mfma_splitk,
         grid_splitk, block_splitk, smem_bytes, 0,
         Q_float.data_ptr<float>(),
         (const unsigned char*)KV_bytes.data_ptr<int8_t>(),
@@ -373,16 +683,19 @@ torch::Tensor mla_hip_forward(
         partial_max.data_ptr<float>(),
         partial_sum_exp.data_ptr<float>(),
         kv_indptr.data_ptr<int>(),
-        kv_scale * sm_scale,
+        sm_scale,
+        kv_scale,
         num_kv_splits
     );
 
+    // Allocate output
     int total_heads = batch_size * num_heads;
     auto output = torch::zeros({total_heads, v_dim},
                                 torch::dtype(torch::kFloat32).device(Q.device()));
 
+    // Launch reduce kernel
     dim3 grid_reduce(batch_size, num_heads);
-    dim3 block_reduce(BLOCK_SIZE);
+    dim3 block_reduce(REDUCE_BLOCK);
 
     hipLaunchKernelGGL(
         mla_reduce,
@@ -399,7 +712,11 @@ torch::Tensor mla_hip_forward(
 }
 """
 
-hip_cpp_source = r"""
+# ===================================================================
+# C++ SOURCES (pybind declaration)
+# ===================================================================
+
+cpp_source = r"""
 #include <torch/extension.h>
 
 torch::Tensor mla_hip_forward(
@@ -413,478 +730,84 @@ torch::Tensor mla_hip_forward(
 );
 """
 
-# Compile HIP kernel
+# ===================================================================
+# COMPILE
+# ===================================================================
+
 _hip_module = None
 _hip_available = False
 
 
-def _try_compile_hip():
+def _try_compile():
     global _hip_module, _hip_available
     if _hip_module is not None:
         return _hip_available
     try:
         from torch.utils.cpp_extension import load_inline
         _hip_module = load_inline(
-            name="mla_hip_v13",
-            cpp_sources=hip_cpp_source,
+            name="mla_hip_phase4a",
+            cpp_sources=cpp_source,
             cuda_sources=hip_source,
             functions=["mla_hip_forward"],
-            verbose=False,
-            extra_cuda_cflags=["-O3", "-mllvm", "-amdgpu-early-inline-all=true",
-                               "-mllvm", "-amdgpu-function-calls=false"],
+            verbose=True,
+            extra_cuda_cflags=[
+                "-O3",
+                "-mcpu=gfx950",
+                "-mllvm", "-amdgpu-early-inline-all=true",
+                "-mllvm", "-amdgpu-function-calls=false",
+            ],
         )
         _hip_available = True
-        print("[v13 HIP] Compilation SUCCESS")
+        print("[HIP Phase 4a MFMA] Compilation SUCCESS")
     except Exception as e:
         _hip_available = False
-        print(f"[v13 HIP] Compilation FAILED: {e}")
+        print(f"[HIP Phase 4a MFMA] Compilation FAILED: {e}")
         import traceback
         traceback.print_exc()
     return _hip_available
 
 
-_try_compile_hip()
+_try_compile()
 
 
 # ===================================================================
-# SECTION 2: AITER IMPORTS (best-effort)
+# AITER FALLBACK
 # ===================================================================
 
 _aiter_available = False
 try:
-    import aiter
     from aiter.mla import mla_decode_fwd
     from aiter import dtypes as aiter_dtypes
     from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
-    from aiter.utility.fp4_utils import dynamic_mxfp4_quant
     _aiter_available = True
     FP8_DTYPE = aiter_dtypes.fp8
-    print("[v13 AITER] Import SUCCESS")
-except ImportError as e:
+except ImportError:
     FP8_DTYPE = torch.float8_e4m3fnuz
-    print(f"[v13 AITER] Import FAILED: {e}")
 
+_meta_cache = {}
 
-# ===================================================================
-# SECTION 3: FUSED FP8 QUANTIZATION TRITON KERNELS
-# ===================================================================
 
-@triton.jit
-def _amax_kernel(
-    input_ptr,
-    amax_ptr,
-    N,
-    BLOCK: tl.constexpr,
-):
-    """Each block computes local amax, then atomically updates global max."""
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
-
-    x = tl.load(input_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    local_amax = tl.max(tl.abs(x))
-
-    tl.atomic_max(amax_ptr, local_amax)
-
-
-@triton.jit
-def _quantize_fp8_kernel(
-    input_ptr,
-    output_ptr,
-    amax_ptr,
-    scale_ptr,
-    fp8_max,
-    fp8_min,
-    N,
-    BLOCK: tl.constexpr,
-):
-    """Read global amax, compute scale = amax / fp8_max, quantize elements."""
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
-
-    amax = tl.load(amax_ptr)
-    amax = tl.maximum(amax, 1e-12)
-    scale = amax / fp8_max
-
-    if pid == 0:
-        tl.store(scale_ptr, scale)
-
-    x = tl.load(input_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    x_scaled = x / scale
-    x_clamped = tl.minimum(tl.maximum(x_scaled, fp8_min), fp8_max)
-
-    tl.store(output_ptr + offs, x_clamped, mask=mask)
-
-
-def _get_fp8_buffers(num_elements, shape, device):
-    """Get or allocate pre-allocated FP8 quantization buffers."""
-    key = (num_elements, device)
-    if key not in _fp8_buf_cache:
-        _fp8_buf_cache[key] = {
-            "fp8_out": torch.empty(num_elements, dtype=FP8_DTYPE, device=device),
-            "scale_out": torch.empty(1, dtype=torch.float32, device=device),
-            "amax_buf": torch.zeros(1, dtype=torch.float32, device=device),
-        }
-    return _fp8_buf_cache[key]
-
-
-def fused_quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize a tensor to FP8 using two fused Triton kernels with pre-allocated buffers.
-    Returns (fp8_tensor, scale).
-    """
-    finfo = torch.finfo(FP8_DTYPE)
-    fp8_max_val = finfo.max
-    fp8_min_val = finfo.min
-
-    flat = tensor.reshape(-1)
-    N = flat.numel()
-
-    bufs = _get_fp8_buffers(N, tensor.shape, tensor.device)
-    fp8_flat = bufs["fp8_out"]
-    scale_out = bufs["scale_out"]
-    amax_buf = bufs["amax_buf"]
-
-    amax_buf.zero_()
-
-    BLOCK = 1024
-    grid_size = (N + BLOCK - 1) // BLOCK
-
-    _amax_kernel[(grid_size,)](
-        flat, amax_buf, N,
-        BLOCK=BLOCK,
-    )
-
-    _quantize_fp8_kernel[(grid_size,)](
-        flat, fp8_flat, amax_buf, scale_out,
-        fp8_max_val, fp8_min_val, N,
-        BLOCK=BLOCK,
-    )
-
-    return fp8_flat.view(tensor.shape), scale_out
-
-
-# ===================================================================
-# SECTION 4: MXFP4 TRITON KERNELS
-# ===================================================================
-
-@triton.jit
-def _mla_mxfp4_stage1(
-    Q_packed_ptr,     # [batch*16, 288] uint8 (packed e2m1)
-    Q_scale_ptr,      # [batch*16, 18] uint8 (e8m0 scales)
-    K_packed_ptr,     # [total_kv, 288] uint8 (packed e2m1)
-    K_scale_ptr,      # [total_kv, 18] uint8 (e8m0 scales)
-    V_bf16_ptr,       # [total_kv, 576] bf16 (first 512 dims used)
-    Partial_O_ptr,    # [batch, splits, 16, V_DIM] f32
-    Partial_m_ptr,    # [batch, splits, 16] f32
-    Partial_l_ptr,    # [batch, splits, 16] f32
-    kv_indptr_ptr,    # [batch+1] i32
-    stride_q_packed,
-    stride_q_scale,
-    stride_kv_packed,
-    stride_kv_scale,
-    stride_v_tok,
-    stride_po_b, stride_po_s, stride_po_h,
-    stride_ml_b, stride_ml_s, stride_ml_h,
-    sm_scale,
-    BLOCK_N: tl.constexpr,
-    V_CHUNK_D: tl.constexpr,
-    NUM_KV_SPLITS: tl.constexpr,
-    NUM_HEADS: tl.constexpr,
-):
-    """
-    Stage 1: For each (batch, split, v_chunk), compute partial attention.
-    All 16 Q heads processed together (BLOCK_M=16).
-    K dimension tiled in 5 chunks of 128 dims via dot_scaled.
-    V accumulated using regular tl.dot in bf16.
-    """
-    LOG2E: tl.constexpr = 1.4426950408889634
-
-    pid_bs = tl.program_id(0)
-    pid_v = tl.program_id(2)
-
-    pid_b = pid_bs // NUM_KV_SPLITS
-    pid_s = pid_bs % NUM_KV_SPLITS
-
-    kv_start = tl.load(kv_indptr_ptr + pid_b)
-    kv_end = tl.load(kv_indptr_ptr + pid_b + 1)
-    kv_len = kv_end - kv_start
-
-    split_size = tl.cdiv(kv_len, NUM_KV_SPLITS)
-    split_kv_start = pid_s * split_size
-    split_kv_end = tl.minimum(split_kv_start + split_size, kv_len)
-
-    q_row_base = pid_b * NUM_HEADS
-    offs_m = tl.arange(0, NUM_HEADS)
-
-    vd_start = pid_v * V_CHUNK_D
-
-    m_prev = tl.full([NUM_HEADS], float("-inf"), dtype=tl.float32)
-    l_prev = tl.zeros([NUM_HEADS], dtype=tl.float32)
-    acc = tl.zeros([NUM_HEADS, V_CHUNK_D], dtype=tl.float32)
-
-    num_tiles = tl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
-
-    for tile_idx in range(num_tiles):
-        tile_start = split_kv_start + tile_idx * BLOCK_N
-        kv_offsets = tile_start + tl.arange(0, BLOCK_N)
-        mask_kv = kv_offsets < split_kv_end
-        kv_idx = kv_start + kv_offsets
-
-        qk = tl.zeros([NUM_HEADS, BLOCK_N], dtype=tl.float32)
-
-        for k_tile in tl.static_range(5):
-            k_packed_start = k_tile * 64
-            k_scale_start = k_tile * 4
-
-            q_d_offs = k_packed_start + tl.arange(0, 64)
-            q_chunk = tl.load(
-                Q_packed_ptr + (q_row_base + offs_m[:, None]) * stride_q_packed + q_d_offs[None, :],
-                mask=(q_d_offs[None, :] < 288),
-                other=0,
-            )
-
-            qs_offs = k_scale_start + tl.arange(0, 4)
-            q_scale_chunk = tl.load(
-                Q_scale_ptr + (q_row_base + offs_m[:, None]) * stride_q_scale + qs_offs[None, :],
-                mask=(qs_offs[None, :] < 18),
-                other=0,
-            )
-
-            k_d_offs = k_packed_start + tl.arange(0, 64)
-            k_chunk = tl.load(
-                K_packed_ptr + kv_idx[None, :] * stride_kv_packed + k_d_offs[:, None],
-                mask=mask_kv[None, :] & (k_d_offs[:, None] < 288),
-                other=0,
-            )
-
-            ks_offs = k_scale_start + tl.arange(0, 4)
-            k_scale_chunk = tl.load(
-                K_scale_ptr + kv_idx[:, None] * stride_kv_scale + ks_offs[None, :],
-                mask=mask_kv[:, None] & (ks_offs[None, :] < 18),
-                other=0,
-            )
-
-            qk = tl.dot_scaled(
-                q_chunk, q_scale_chunk, "e2m1",
-                k_chunk, k_scale_chunk, "e2m1",
-                fast_math=True, acc=qk,
-            )
-
-        qk *= sm_scale
-        qk = tl.where(mask_kv[None, :], qk, float("-inf"))
-
-        m_new = tl.maximum(m_prev, tl.max(qk, 1))
-        alpha = tl.math.exp2((m_prev - m_new) * LOG2E)
-        p = tl.math.exp2((qk - m_new[:, None]) * LOG2E)
-        p = tl.where(mask_kv[None, :], p, 0.0)
-
-        acc = acc * alpha[:, None]
-        l_prev = l_prev * alpha + tl.sum(p, 1)
-        m_prev = m_new
-
-        vd_offsets = vd_start + tl.arange(0, V_CHUNK_D)
-        v_tile = tl.load(
-            V_bf16_ptr + kv_idx[:, None] * stride_v_tok + vd_offsets[None, :],
-            mask=mask_kv[:, None],
-            other=0.0,
-        )
-        acc += tl.dot(p.to(tl.bfloat16), v_tile, out_dtype=tl.float32)
-
-    po_base = (Partial_O_ptr + pid_b * stride_po_b + pid_s * stride_po_s + vd_start)
-    head_offs = tl.arange(0, NUM_HEADS)
-    v_offs = tl.arange(0, V_CHUNK_D)
-    tl.store(
-        po_base + head_offs[:, None] * stride_po_h + v_offs[None, :],
-        acc,
-    )
-
-    if pid_v == 0:
-        ml_base = pid_b * stride_ml_b + pid_s * stride_ml_s
-        tl.store(
-            Partial_m_ptr + ml_base + head_offs * stride_ml_h,
-            m_prev,
-        )
-        tl.store(
-            Partial_l_ptr + ml_base + head_offs * stride_ml_h,
-            l_prev,
-        )
-
-
-@triton.jit
-def _mla_mxfp4_reduce(
-    Partial_O_ptr, Partial_m_ptr, Partial_l_ptr, O_ptr,
-    stride_po_b, stride_po_s, stride_po_h,
-    stride_ml_b, stride_ml_s, stride_ml_h,
-    stride_o_batch, stride_o_head,
-    NUM_KV_SPLITS: tl.constexpr,
-    V_CHUNK_D: tl.constexpr,
-    NUM_HEADS: tl.constexpr,
-):
-    """Reduce across splits for one (batch, head, v_chunk)."""
-    pid_b = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_v = tl.program_id(2)
-    vd_start = pid_v * V_CHUNK_D
-
-    m_global = tl.full([], float("-inf"), dtype=tl.float32)
-    for s in tl.static_range(NUM_KV_SPLITS):
-        m_s = tl.load(Partial_m_ptr + pid_b * stride_ml_b + s * stride_ml_s + pid_h * stride_ml_h)
-        m_global = tl.maximum(m_global, m_s)
-
-    l_global = tl.full([], 0.0, dtype=tl.float32)
-    acc = tl.zeros([V_CHUNK_D], dtype=tl.float32)
-    v_offsets = tl.arange(0, V_CHUNK_D)
-
-    for s in tl.static_range(NUM_KV_SPLITS):
-        m_s = tl.load(Partial_m_ptr + pid_b * stride_ml_b + s * stride_ml_s + pid_h * stride_ml_h)
-        l_s = tl.load(Partial_l_ptr + pid_b * stride_ml_b + s * stride_ml_s + pid_h * stride_ml_h)
-        rescale = tl.math.exp(m_s - m_global)
-        l_global += l_s * rescale
-
-        po_base = (Partial_O_ptr + pid_b * stride_po_b + s * stride_po_s
-                   + pid_h * stride_po_h + vd_start)
-        partial = tl.load(po_base + v_offsets)
-        acc += rescale * partial
-
-    acc = acc / (l_global + 1e-10)
-    o_base = O_ptr + pid_b * stride_o_batch + pid_h * stride_o_head + vd_start
-    tl.store(o_base + v_offsets, acc.to(tl.bfloat16))
-
-
-# ===================================================================
-# SECTION 5: MXFP4 BUFFER CACHE AND DECODE PATH
-# ===================================================================
-
-def _mxfp4_get_buffers(batch_size, num_kv_splits, device):
-    key = (batch_size, num_kv_splits)
-    if key not in _mxfp4_buf_cache:
-        _mxfp4_buf_cache[key] = {
-            "partial_o": torch.empty(
-                (batch_size, num_kv_splits, NUM_HEADS, V_HEAD_DIM),
-                dtype=torch.float32, device=device,
-            ),
-            "partial_m": torch.empty(
-                (batch_size, num_kv_splits, NUM_HEADS),
-                dtype=torch.float32, device=device,
-            ),
-            "partial_l": torch.empty(
-                (batch_size, num_kv_splits, NUM_HEADS),
-                dtype=torch.float32, device=device,
-            ),
-            "output": torch.empty(
-                (batch_size, NUM_HEADS, V_HEAD_DIM),
-                dtype=torch.bfloat16, device=device,
-            ),
-        }
-    return _mxfp4_buf_cache[key]
-
-
-def _mxfp4_path(q, kv_data, kv_indptr, config):
-    """
-    MXFP4 MLA decode using hardware tl.dot_scaled on MI355X.
-    Q quantized to MXFP4, K via dot_scaled, V via bf16 tl.dot.
-    """
-    batch_size = config["batch_size"]
-    kv_seq_len = config["kv_seq_len"]
-
-    num_kv_splits = MXFP4_KV_SPLITS_MAP.get(
-        (batch_size, kv_seq_len), MXFP4_DEFAULT_KV_SPLITS
-    )
-
-    kv_fp4, kv_scale = kv_data["mxfp4"]
-    kv_bf16 = kv_data["bf16"]
-
-    q_2d = q.view(-1, QK_HEAD_DIM)  # (batch*16, 576)
-    q_packed_raw, q_scale_raw = dynamic_mxfp4_quant(q_2d)
-    q_packed = q_packed_raw.view(torch.uint8)
-    q_scale = q_scale_raw.view(torch.uint8)
-
-    kv_fp4_2d = kv_fp4.reshape(-1, PACKED_QK).view(torch.uint8)  # (total_kv, 288)
-    kv_scale_2d = kv_scale.view(torch.uint8) if kv_scale.dtype != torch.uint8 else kv_scale
-    v_bf16_2d = kv_bf16.view(-1, QK_HEAD_DIM)  # (total_kv, 576)
-
-    BLOCK_N = 64
-    V_CHUNK_D = 128
-    num_v_chunks = V_HEAD_DIM // V_CHUNK_D  # 512 / 128 = 4
-
-    bufs = _mxfp4_get_buffers(batch_size, num_kv_splits, q.device)
-
-    grid1 = (batch_size * num_kv_splits, 1, num_v_chunks)
-    _mla_mxfp4_stage1[grid1](
-        q_packed, q_scale,
-        kv_fp4_2d, kv_scale_2d,
-        v_bf16_2d,
-        bufs["partial_o"], bufs["partial_m"], bufs["partial_l"],
-        kv_indptr,
-        q_packed.stride(0), q_scale.stride(0),
-        kv_fp4_2d.stride(0), kv_scale_2d.stride(0),
-        v_bf16_2d.stride(0),
-        bufs["partial_o"].stride(0), bufs["partial_o"].stride(1), bufs["partial_o"].stride(2),
-        bufs["partial_m"].stride(0), bufs["partial_m"].stride(1), bufs["partial_m"].stride(2),
-        SM_SCALE,
-        BLOCK_N=BLOCK_N, V_CHUNK_D=V_CHUNK_D,
-        NUM_KV_SPLITS=num_kv_splits,
-        NUM_HEADS=NUM_HEADS,
-    )
-
-    grid2 = (batch_size, NUM_HEADS, num_v_chunks)
-    _mla_mxfp4_reduce[grid2](
-        bufs["partial_o"], bufs["partial_m"], bufs["partial_l"], bufs["output"],
-        bufs["partial_o"].stride(0), bufs["partial_o"].stride(1), bufs["partial_o"].stride(2),
-        bufs["partial_m"].stride(0), bufs["partial_m"].stride(1), bufs["partial_m"].stride(2),
-        bufs["output"].stride(0), bufs["output"].stride(1),
-        NUM_KV_SPLITS=num_kv_splits,
-        V_CHUNK_D=V_CHUNK_D,
-        NUM_HEADS=NUM_HEADS,
-    )
-
-    return bufs["output"]
-
-
-# ===================================================================
-# SECTION 6: HIP DECODE PATH
-# ===================================================================
-
-def _hip_path(q, kv_data, kv_indptr, config):
-    """
-    HIP kernel path for small batch + short KV (Phase 3.5 scalar FP8 dequant).
-    Falls back to MXFP4 or AITER if HIP compilation failed.
-    """
+def _aiter_fallback(data):
+    """Standard AITER decode path as fallback."""
+    q, kv_data, qo_indptr, kv_indptr, config = data
     bs = config["batch_size"]
 
+    finfo = torch.finfo(FP8_DTYPE)
+    amax = q.abs().amax().clamp(min=1e-12)
+    scale = amax / finfo.max
+    q_fp8 = (q / scale).clamp(min=finfo.min, max=finfo.max).to(FP8_DTYPE)
+    q_scale = scale.to(torch.float32).reshape(1)
+
     kv_fp8, kv_scale = kv_data["fp8"]
-    kv_scale_val = kv_scale.item()
-    kv_bytes = kv_fp8.view(torch.int8).contiguous()
+    total_kv = int(kv_indptr[-1].item())
+    kv_indices = torch.arange(total_kv, dtype=torch.int32, device="cuda")
+    kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
 
-    output = _hip_module.mla_hip_forward(
-        q,
-        kv_bytes,
-        kv_indptr,
-        kv_scale_val,
-        SM_SCALE,
-        bs,
-        HIP_NUM_KV_SPLITS,
-    )
-
-    return output
-
-
-# ===================================================================
-# SECTION 7: AITER CACHED METADATA
-# ===================================================================
-
-def _get_cached_meta(bs, nq, nkv, q_dtype, kv_dtype, qo_indptr, kv_indptr, num_kv_splits):
-    """Cached metadata for the AITER wrapper path."""
-    key = ("wrapper", bs, num_kv_splits, q_dtype, kv_dtype)
+    num_kv_splits = 16
+    key = (bs, num_kv_splits, q_fp8.dtype, kv_fp8.dtype)
     if key not in _meta_cache:
-        kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
-        total_kv = int(kv_indptr[-1].item())
-        kv_indices = torch.arange(total_kv, dtype=torch.int32, device="cuda")
-
         info = get_mla_metadata_info_v1(
-            bs, 1, nq, q_dtype, kv_dtype,
+            bs, 1, NUM_HEADS, q_fp8.dtype, kv_fp8.dtype,
             is_sparse=False, fast_mode=False,
             num_kv_splits=num_kv_splits, intra_batch_mode=True,
         )
@@ -892,173 +815,21 @@ def _get_cached_meta(bs, nq, nkv, q_dtype, kv_dtype, qo_indptr, kv_indptr, num_k
         (wm, wi, wis, ri, rfm, rpm) = work
         get_mla_metadata_v1(
             qo_indptr, kv_indptr, kv_last_page_len,
-            nq // nkv, nkv, True,
+            NUM_HEADS // NUM_KV_HEADS, NUM_KV_HEADS, True,
             wm, wis, wi, ri, rfm, rpm,
             page_size=PAGE_SIZE, kv_granularity=max(PAGE_SIZE, 16),
             max_seqlen_qo=1, uni_seqlen_qo=1,
             fast_mode=False, max_split_per_batch=num_kv_splits,
-            intra_batch_mode=True, dtype_q=q_dtype, dtype_kv=kv_dtype,
+            intra_batch_mode=True, dtype_q=q_fp8.dtype, dtype_kv=kv_fp8.dtype,
         )
         _meta_cache[key] = {
             "work_meta_data": wm, "work_indptr": wi, "work_info_set": wis,
             "reduce_indptr": ri, "reduce_final_map": rfm, "reduce_partial_map": rpm,
             "kv_indices": kv_indices, "kv_last_page_len": kv_last_page_len,
         }
-    return _meta_cache[key]
+    meta = _meta_cache[key]
 
-
-def _get_cached_bypass_meta(bs, nq, nkv, q_dtype, kv_dtype, qo_indptr, kv_indptr, num_kv_splits):
-    """Cached metadata for the AITER bypass path (includes logits/attn_lse buffers)."""
-    key = ("bypass", bs, num_kv_splits, q_dtype, kv_dtype)
-    if key not in _bypass_meta_cache:
-        kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
-        total_kv = int(kv_indptr[-1].item())
-        kv_indices = torch.arange(total_kv, dtype=torch.int32, device="cuda")
-
-        info = get_mla_metadata_info_v1(
-            bs, 1, nq, q_dtype, kv_dtype,
-            is_sparse=False, fast_mode=False,
-            num_kv_splits=num_kv_splits, intra_batch_mode=True,
-        )
-        work = [torch.empty(s, dtype=t, device="cuda") for s, t in info]
-        (wm, wi, wis, ri, rfm, rpm) = work
-        get_mla_metadata_v1(
-            qo_indptr, kv_indptr, kv_last_page_len,
-            nq // nkv, nkv, True,
-            wm, wis, wi, ri, rfm, rpm,
-            page_size=PAGE_SIZE, kv_granularity=max(PAGE_SIZE, 16),
-            max_seqlen_qo=1, uni_seqlen_qo=1,
-            fast_mode=False, max_split_per_batch=num_kv_splits,
-            intra_batch_mode=True, dtype_q=q_dtype, dtype_kv=kv_dtype,
-        )
-
-        num_partials = rpm.size(0)
-        logits = torch.empty(
-            (num_partials, 1, NUM_HEADS, V_HEAD_DIM),
-            dtype=torch.float32, device="cuda",
-        )
-        attn_lse = torch.empty(
-            (num_partials, 1, NUM_HEADS, 1),
-            dtype=torch.float32, device="cuda",
-        )
-
-        _bypass_meta_cache[key] = {
-            "work_meta_data": wm, "work_indptr": wi, "work_info_set": wis,
-            "reduce_indptr": ri, "reduce_final_map": rfm, "reduce_partial_map": rpm,
-            "kv_indices": kv_indices, "kv_last_page_len": kv_last_page_len,
-            "logits": logits, "attn_lse": attn_lse,
-        }
-    return _bypass_meta_cache[key]
-
-
-def _get_cached_allocs(bs, nq, device):
-    key = (bs, nq)
-    if key not in _alloc_cache:
-        _alloc_cache[key] = {
-            "output": torch.empty((bs, nq, V_HEAD_DIM), dtype=torch.bfloat16, device=device),
-        }
-    return _alloc_cache[key]
-
-
-# ===================================================================
-# SECTION 8: AITER BYPASS PATH (direct C++ calls)
-# ===================================================================
-
-def _aiter_bypass_path(q, kv_data, qo_indptr, kv_indptr, config):
-    """
-    AITER path calling C++ functions directly, bypassing the Python wrapper.
-    Saves 16-20 us per call by eliminating torch.empty allocations for
-    logits and attn_lse intermediate buffers.
-
-    Used for: (32, 8192), (64, 8192)
-    """
-    bs = config["batch_size"]
-    kvlen = config["kv_seq_len"]
-    num_kv_splits = AITER_KV_SPLITS_MAP.get((bs, kvlen), AITER_DEFAULT_KV_SPLITS)
-
-    q_fp8, q_scale = fused_quantize_fp8(q)
-
-    kv_fp8, kv_scale = kv_data["fp8"]
-
-    meta = _get_cached_bypass_meta(
-        bs, NUM_HEADS, NUM_KV_HEADS,
-        q_fp8.dtype, kv_fp8.dtype,
-        qo_indptr, kv_indptr, num_kv_splits,
-    )
-    allocs = _get_cached_allocs(bs, NUM_HEADS, q.device)
-    o = allocs["output"]
-
-    kv_4d = kv_fp8.view(kv_fp8.shape[0], PAGE_SIZE, NUM_KV_HEADS, kv_fp8.shape[-1])
-
-    logits = meta["logits"]
-    attn_lse = meta["attn_lse"]
-
-    # Direct call to AITER C++ stage1 -- 19 args (no final_lse parameter)
-    aiter.mla_decode_stage1_asm_fwd(
-        q_fp8.view(-1, NUM_HEADS, QK_HEAD_DIM),
-        kv_4d,
-        qo_indptr,
-        kv_indptr,
-        meta["kv_indices"],
-        meta["kv_last_page_len"],
-        None,                              # num_kv_splits_indptr
-        meta["work_meta_data"],
-        meta["work_indptr"],
-        meta["work_info_set"],
-        1,                                 # max_seqlen_q
-        PAGE_SIZE,                         # page_size
-        NUM_KV_HEADS,                      # nhead_kv
-        SM_SCALE,                          # sm_scale
-        logits,                            # splitData (cached)
-        attn_lse,                          # splitLse (cached)
-        o,                                 # output
-        q_scale,                           # q_scale
-        kv_scale,                          # kv_scale
-    )
-
-    # Direct call to AITER C++ reduce
-    aiter.mla_reduce_v1(
-        logits,
-        attn_lse,
-        meta["reduce_indptr"],
-        meta["reduce_final_map"],
-        meta["reduce_partial_map"],
-        1,                                 # max_seqlen_q
-        o,                                 # final_output
-        None,                              # final_lse
-    )
-
-    return o
-
-
-# ===================================================================
-# SECTION 9: AITER WRAPPER PATH (standard mla_decode_fwd)
-# ===================================================================
-
-def _aiter_wrapper_path(q, kv_data, qo_indptr, kv_indptr, config):
-    """
-    AITER path using the standard mla_decode_fwd Python wrapper with
-    cached metadata. Bypass hurts bs=256 configs (+12 us), so we keep
-    the wrapper for those.
-
-    Used for: (256, 1024), (256, 8192)
-    """
-    bs = config["batch_size"]
-    kvlen = config["kv_seq_len"]
-    num_kv_splits = AITER_KV_SPLITS_MAP.get((bs, kvlen), AITER_DEFAULT_KV_SPLITS)
-
-    q_fp8, q_scale = fused_quantize_fp8(q)
-
-    kv_fp8, kv_scale = kv_data["fp8"]
-
-    meta = _get_cached_meta(
-        bs, NUM_HEADS, NUM_KV_HEADS,
-        q_fp8.dtype, kv_fp8.dtype,
-        qo_indptr, kv_indptr, num_kv_splits,
-    )
-    allocs = _get_cached_allocs(bs, NUM_HEADS, q.device)
-    o = allocs["output"]
-
+    o = torch.empty((bs, NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16, device="cuda")
     kv_4d = kv_fp8.view(kv_fp8.shape[0], PAGE_SIZE, NUM_KV_HEADS, kv_fp8.shape[-1])
 
     mla_decode_fwd(
@@ -1066,8 +837,7 @@ def _aiter_wrapper_path(q, kv_data, qo_indptr, kv_indptr, config):
         kv_4d, o,
         qo_indptr, kv_indptr,
         meta["kv_indices"], meta["kv_last_page_len"],
-        1,
-        page_size=PAGE_SIZE, nhead_kv=NUM_KV_HEADS,
+        1, page_size=PAGE_SIZE, nhead_kv=NUM_KV_HEADS,
         sm_scale=SM_SCALE, logit_cap=0.0,
         num_kv_splits=num_kv_splits,
         q_scale=q_scale, kv_scale=kv_scale,
@@ -1083,44 +853,34 @@ def _aiter_wrapper_path(q, kv_data, qo_indptr, kv_indptr, config):
 
 
 # ===================================================================
-# SECTION 10: ENTRY POINT WITH ROUTING
+# ENTRY POINT
 # ===================================================================
 
 @torch.inference_mode()
 def custom_kernel(data: input_t) -> output_t:
     q, kv_data, qo_indptr, kv_indptr, config = data
     bs = config["batch_size"]
-    kvlen = config["kv_seq_len"]
 
-    # Route 1: HIP kernel for small batch + short KV
-    if (bs, kvlen) in HIP_CONFIGS and _hip_available:
-        return _hip_path(q, kv_data, kv_indptr, config)
-
-    # Route 2: MXFP4 Triton for medium configs (or HIP fallback targets)
-    if (bs, kvlen) in MXFP4_CONFIGS:
+    if not _hip_available:
         if _aiter_available:
-            return _mxfp4_path(q, kv_data, kv_indptr, config)
-        # If AITER not available (no dynamic_mxfp4_quant), fall through
+            print("[HIP Phase 4a] MFMA compilation failed, using AITER fallback")
+            return _aiter_fallback(data)
+        else:
+            raise RuntimeError("Neither HIP MFMA kernel nor AITER available")
 
-    # Route 2b: HIP fallback -- if HIP failed, route its configs to MXFP4 or AITER
-    if (bs, kvlen) in HIP_CONFIGS and not _hip_available:
-        if _aiter_available:
-            return _mxfp4_path(q, kv_data, kv_indptr, config)
-        # Last resort: AITER wrapper (needs aiter)
+    kv_fp8, kv_scale = kv_data["fp8"]
+    kv_scale_val = kv_scale.item()
 
-    # Route 3: AITER bypass for medium-batch + long KV
-    if (bs, kvlen) in BYPASS_CONFIGS and _aiter_available:
-        return _aiter_bypass_path(q, kv_data, qo_indptr, kv_indptr, config)
+    kv_bytes = kv_fp8.view(torch.int8).contiguous()
 
-    # Route 4: AITER wrapper for large batch (default)
-    if _aiter_available:
-        return _aiter_wrapper_path(q, kv_data, qo_indptr, kv_indptr, config)
-
-    # Ultimate fallback: HIP kernel for everything (if available)
-    if _hip_available:
-        return _hip_path(q, kv_data, kv_indptr, config)
-
-    raise RuntimeError(
-        f"[v13] No available backend for config (bs={bs}, kvlen={kvlen}). "
-        f"HIP available: {_hip_available}, AITER available: {_aiter_available}"
+    output = _hip_module.mla_hip_forward(
+        q,
+        kv_bytes,
+        kv_indptr,
+        kv_scale_val,
+        SM_SCALE,
+        bs,
+        NUM_KV_SPLITS,
     )
+
+    return output
