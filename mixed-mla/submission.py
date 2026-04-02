@@ -13,7 +13,8 @@ Block: 64 threads = 1 wave (minimal for MFMA)
 Register layout for v_mfma_f32_16x16x128_f8f6f4 (wave64):
   A[M=16, K=128]: thread t holds A[t%16, (t/16)*32 : (t/16)*32+32] = 32 bytes = 8 int32
   B[K=128, N=16]: thread t holds B[(t/16)*32 : (t/16)*32+32, t%16] = 32 bytes = 8 int32
-  C[M=16, N=16]:  thread t holds C[t%16, (t/16)*4 : (t/16)*4+4] = 4 float32
+  C[M=16, N=16]:  thread t holds C[(t/16)*4+i, t%16] for i=0..3 = 4 float32
+                   i.e. reg i = C[row=(t/16)*4+i, col=t%16]
 
 gfx950 ONLY. Cannot test on MI300X.
 """
@@ -257,8 +258,8 @@ void mla_decode_mfma_splitk(
     int lane = tid;
 
     // MFMA lane mapping
-    int lane_row = lane % 16;     // which head (for A) / which token col (for B) / which C row
-    int lane_kgrp = lane / 16;    // which K-group (0..3), each covers 32 K elements
+    int lane_row = lane % 16;     // which head (for A) / which token col (for B) / which C col (token)
+    int lane_kgrp = lane / 16;    // which K-group (0..3), each covers 32 K elements; C row base = lane_kgrp*4
 
     // KV range for this batch
     int kv_start_all = kv_indptr[batch];
@@ -479,15 +480,15 @@ void mla_decode_mfma_splitk(
         }
 
         // --- Extract QK scores to shared memory ---
-        // After MFMA: thread tid holds C[lane_row, lane_kgrp*4 : lane_kgrp*4+4]
-        // = scores[head=lane_row, tokens=lane_kgrp*4..lane_kgrp*4+3]
+        // After MFMA: thread tid holds C[row=(t/16)*4+i, col=t%16] for reg i
+        // Row = M dimension = head, Col = N dimension = token
+        // So: qk_acc[i] = scores[head = lane_kgrp*4+i, token = lane_row]
         // Need to store as smem_scores[head][token]
         //
         // Apply combined scale: q_scale * kv_scale * sm_scale
         // The MFMA computes: sum(dequant(Q_fp8[h,k]) * dequant(K_fp8[t,k]))
         // Q_fp8 was quantized as: Q_fp8 = fp8(Q_f32 / q_scale_val)
         // So dequant(Q_fp8) ~= Q_f32 / q_scale_val
-        // K_fp8 is the original FP8 data, dequant(K_fp8) ~= K_original / kv_scale? No.
         // K_fp8 IS the stored KV cache. dequant(K_fp8) gives the FP8 numeric value.
         // The actual K value is: K_actual = dequant(K_fp8) * kv_scale.
         // So MFMA result = sum((Q_f32/q_scale) * dequant(K_fp8))
@@ -498,8 +499,8 @@ void mla_decode_mfma_splitk(
 
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            int token_idx = lane_kgrp * 4 + i;
-            int head_idx = lane_row;
+            int head_idx = lane_kgrp * 4 + i;
+            int token_idx = lane_row;
             smem_scores[head_idx * BLOCK_N + token_idx] = qk_acc[i] * combined_scale;
         }
 
