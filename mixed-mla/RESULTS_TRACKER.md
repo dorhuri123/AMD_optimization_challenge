@@ -78,7 +78,7 @@ All times in **μs**. Only versions with leaderboard data included.
 | bs=256, kv=1024 | 51.9 | a16w8 pg2 |
 | bs=256, kv=8192 | 304 | a16w8 pg2 |
 
-### v24 — 3-way hybrid (geomean: 46.0 μs) ⭐ NEW BEST
+### v24 — 3-way hybrid (leaderboard: 47.521 μs) ⭐ CURRENT BEST
 | Config | μs | Path |
 |---|---|---|
 | bs=4, kv=1024 | 20.9 | MXFP4 Triton |
