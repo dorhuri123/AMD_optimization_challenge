@@ -42,7 +42,7 @@ QK_ROPE_HEAD_DIM: int = 64
 QK_HEAD_DIM: int = 576  # KV_LORA_RANK + QK_ROPE_HEAD_DIM
 V_HEAD_DIM: int = 512   # KV_LORA_RANK
 SM_SCALE: float = 1.0 / (QK_HEAD_DIM ** 0.5)
-PAGE_SIZE: int = 2  # Competitor "pg2" at 33μs uses page_size=2
+PAGE_SIZE: int = 1
 FP8_DTYPE = aiter_dtypes.fp8
 
 # K dim layout: 576 = 4*128 + 64 -> 5 tiles of 128 (last padded)
@@ -68,8 +68,8 @@ MXFP4_DEFAULT_KV_SPLITS = 8
 AITER_KV_SPLITS_MAP = {
     (32, 8192): 24,    # was 48 in v11, reduced
     (64, 8192): 16,    # was 24, reduced
-    (256, 1024): 16,   # v17 showed 16 better than 8 on MI355X
-    (256, 8192): 24,   # v17 showed 24 better than 16 on MI355X
+    (256, 1024): 16,   # v17 showed 16 is better than 8 on MI355X (101 vs 107μs)
+    (256, 8192): 24,   # v17 showed 24 is better than 16 on MI355X (293 vs 302μs)
 }
 AITER_DEFAULT_KV_SPLITS = 16
 
