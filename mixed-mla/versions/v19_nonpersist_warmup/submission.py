@@ -41,52 +41,8 @@ def quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return fp8_tensor, scale.to(torch.float32).reshape(1)
 
 
-# ===============================================================
-# JIT WARMUP — runs at import time, before eval timing starts
-# ===============================================================
-
-def _warmup():
-    """Pre-warm AITER JIT compilation by running a small dummy call.
-
-    This triggers compilation of BOTH the stage1 ASM kernel and the
-    stage2 Triton reduce kernel. Without this, the first real call
-    pays ~170s of JIT compilation time per unique kernel config.
-    """
-    bs_warmup = 4
-    kv_per_seq = 64
-    total_kv = bs_warmup * kv_per_seq
-
-    q = torch.randn(bs_warmup, NUM_HEADS, QK_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    kv = torch.randn(total_kv, 1, 1, QK_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-
-    q_fp8, q_scale = quantize_fp8(q)
-    kv_fp8, kv_scale = quantize_fp8(kv)
-
-    qo_indptr = torch.arange(0, bs_warmup + 1, dtype=torch.int32, device="cuda")
-    kv_indptr = torch.arange(0, bs_warmup + 1, dtype=torch.int32, device="cuda") * kv_per_seq
-    kv_last_page_len = torch.full((bs_warmup,), kv_per_seq, dtype=torch.int32, device="cuda")
-    kv_indices = torch.arange(total_kv, dtype=torch.int32, device="cuda")
-
-    o = torch.empty(bs_warmup, NUM_HEADS, V_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-
-    # Non-persistent mode (no work_meta_data) — triggers stage1 ASM + stage2 Triton JIT
-    mla_decode_fwd(
-        q_fp8, kv_fp8, o,
-        qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
-        1,  # max_seqlen_q
-        page_size=PAGE_SIZE,
-        nhead_kv=NUM_KV_HEADS,
-        sm_scale=SM_SCALE,
-        q_scale=q_scale,
-        kv_scale=kv_scale,
-    )
-    torch.cuda.synchronize()
-
-
-try:
-    _warmup()
-except Exception:
-    pass  # Warmup failure is OK — just means first real call will be slow
+# NO import-time warmup — KernelGuard blocks it.
+# AITER JIT compilation happens on first call (during eval's warmup phase).
 
 
 # ===============================================================
