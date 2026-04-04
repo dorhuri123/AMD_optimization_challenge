@@ -564,51 +564,28 @@ def _aiter_path_pg2(q, kv_data, qo_indptr, kv_indptr, config):
     allocs = _get_cached_allocs(bs, NUM_HEADS, device)
     o = allocs["output"]
 
-    # Fresh logits/attn_lse each call (avoids L2 cache pollution)
-    num_partials = meta["reduce_partial_map"].size(0)
-    logits = torch.empty(
-        (num_partials, 1, NUM_HEADS, V_HEAD_DIM),
-        dtype=torch.float32, device=device,
-    )
-    attn_lse = torch.empty(
-        (num_partials, 1, NUM_HEADS, 1),
-        dtype=torch.float32, device=device,
-    )
-
-    # Direct C++ persistent stage1 call
-    aiter.mla_decode_stage1_asm_fwd(
+    # Use mla_decode_fwd wrapper (handles arg count correctly on MI355X)
+    mla_decode_fwd(
         q_input,                               # bf16 (a16w8) or fp8 (a8w8)
-        kv_4d,                                 # fp8 (num_pages, 2, 1, 576)
-        qo_indptr,                             # token-based (original)
-        kv_indptr,                             # token-based (original) -- NOT page-based!
-        meta["kv_indices"],                    # page indices: arange(num_pages)
-        meta["kv_last_page_len"],              # all PAGE_SIZE (=2)
-        None,                                  # num_kv_splits_indptr (unused in persistent)
-        meta["work_meta_data"],
-        meta["work_indptr"],
-        meta["work_info_set"],
+        kv_4d, o,
+        qo_indptr, kv_indptr,
+        meta["kv_indices"],
+        meta["kv_last_page_len"],
         1,                                     # max_seqlen_q
-        PAGE_SIZE,                             # page_size=2
-        NUM_KV_HEADS,
-        SM_SCALE,
-        logits,
-        attn_lse,
-        o,
-        None,                                  # final_lse
-        q_scale_input,                         # None for a16w8, fp8 scale for a8w8
-        kv_scale,
-    )
-
-    # Persistent reduce
-    aiter.mla_reduce_v1(
-        logits,
-        attn_lse,
-        meta["reduce_indptr"],
-        meta["reduce_final_map"],
-        meta["reduce_partial_map"],
-        1,                                     # max_seqlen_q
-        o,
-        None,                                  # final_lse
+        page_size=PAGE_SIZE,                   # page_size=2
+        nhead_kv=NUM_KV_HEADS,
+        sm_scale=SM_SCALE,
+        logit_cap=0.0,
+        num_kv_splits=num_kv_splits,
+        q_scale=q_scale_input,                 # None for a16w8, fp8 scale for a8w8
+        kv_scale=kv_scale,
+        intra_batch_mode=True,
+        work_meta_data=meta["work_meta_data"],
+        work_indptr=meta["work_indptr"],
+        work_info_set=meta["work_info_set"],
+        reduce_indptr=meta["reduce_indptr"],
+        reduce_final_map=meta["reduce_final_map"],
+        reduce_partial_map=meta["reduce_partial_map"],
     )
 
     return o
