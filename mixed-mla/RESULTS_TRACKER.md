@@ -78,17 +78,17 @@ All times in **μs**. Only versions with leaderboard data included.
 | bs=256, kv=1024 | 51.9 | a16w8 pg2 |
 | bs=256, kv=8192 | 304 | a16w8 pg2 |
 
-### v24 — 3-way hybrid (pending leaderboard)
-| Config | Expected μs | Path |
+### v24 — 3-way hybrid (geomean: 46.0 μs) ⭐ NEW BEST
+| Config | μs | Path |
 |---|---|---|
-| bs=4, kv=1024 | ~20.9 | MXFP4 Triton (from v12) |
-| bs=4, kv=8192 | ~33.2 | MXFP4 Triton (from v12) |
-| bs=32, kv=1024 | ~29.5 | MXFP4 Triton (from v12) |
-| bs=32, kv=8192 | ~55.7 | a16w8 pg2 (from v23b) |
-| bs=64, kv=1024 | ~34.8 | a16w8 pg2 (from v23b) |
-| bs=64, kv=8192 | ~91.6 | a16w8 pg2 (from v23b) |
-| bs=256, kv=1024 | ~51.9 | a16w8 pg2 (from v23b) |
-| bs=256, kv=8192 | ~302 | a8w8 pg1 splits=24 |
+| bs=4, kv=1024 | 20.9 | MXFP4 Triton |
+| bs=4, kv=8192 | 33.3 | MXFP4 Triton |
+| bs=32, kv=1024 | 29.7 | MXFP4 Triton |
+| bs=32, kv=8192 | 55.7 | a16w8 pg2 |
+| bs=64, kv=1024 | 34.3 | a16w8 pg2 |
+| bs=64, kv=8192 | 91.5 | a16w8 pg2 |
+| bs=256, kv=1024 | 51.9 | a16w8 pg2 |
+| bs=256, kv=8192 | **107** | a8w8 pg1 splits=24 (2.8x faster than v12!) |
 
 ### v25 — v24 + PAGE_SIZE=8 for large kv (pending leaderboard)
 Same as v24 but bs=256,kv=8192 uses a8w8 pg8 instead of pg1.
