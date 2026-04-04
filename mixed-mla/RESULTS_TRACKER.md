@@ -105,3 +105,16 @@ Same as v24 but bs=256,kv=8192 uses a8w8 pg8 instead of pg1.
 | v18 MXFP4+FP8V all | 213.6 | Triton MXFP4 terrible on large configs |
 | v19 non-persistent | failed | Correctness failures on recheck |
 | Phase 4a MFMA | 916+ | Single-wave (64 threads) = terrible occupancy |
+
+### v25 — v24 + pg8 for bs=256,kv=8192 (geomean: 46.5 μs)
+| Config | μs | Path |
+|---|---|---|
+| bs=4, kv=1024 | 20.8 | MXFP4 Triton |
+| bs=4, kv=8192 | 33.2 | MXFP4 Triton |
+| bs=32, kv=1024 | 29.5 | MXFP4 Triton |
+| bs=32, kv=8192 | 57.0 | a16w8 pg2 |
+| bs=64, kv=1024 | 34.7 | a16w8 pg2 |
+| bs=64, kv=8192 | 94.2 | a16w8 pg2 |
+| bs=256, kv=1024 | 53.3 | a16w8 pg2 |
+| bs=256, kv=8192 | 108 | a8w8 pg8 (same as v24's pg1) |
+Note: pg8 didn't improve over pg1 for bs=256,kv=8192.
