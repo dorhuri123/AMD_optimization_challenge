@@ -104,9 +104,11 @@ hip_source = r"""
 //
 // Scale operands (sa, sb): one int32 per thread per MFMA call.
 //   Each MFMA K=128 spans 128/32=4 scale blocks.
-//   The 4 e8m0 scale bytes are packed into one int32.
-//   Byte 0 = scale for K[0:31], byte 1 = K[32:63], byte 2 = K[64:95], byte 3 = K[96:127]
-//   Thread t packs its 4 scale values based on its row assignment.
+//   Scale matrix Ax is [M=16, K/32=4], Bx is [K/32=4, N=16].
+//   Each thread at (lane_row, lane_kgrp) holds ONE scale for its
+//   own (row/col, K-group). With op_sel=0 (op_sel_hi:[0,0,0]),
+//   the hardware reads byte 0 of the int32 scale VGPR.
+//   Thread places its single e8m0 scale byte in byte 0.
 
 #define MFMA_K       128    // K dimension per MFMA instruction (FP4 elements)
 #define NUM_QK_MFMA  5      // ceil(576/128) = 5 MFMA calls for full QK dim
@@ -449,47 +451,42 @@ void mla_mxfp4_splitk(
                     }
                 }
 
-                // Build scale operands (sa, sb): pack 4 e8m0 bytes into one int32
+                // Build scale operands (sa, sb): ONE e8m0 byte per thread
+                //
+                // The v_mfma_scale MFMA uses op_sel to select which byte of the
+                // int32 scale VGPR to read. With op_sel=0 (our setting via
+                // op_sel_hi:[0,0,0]), the hardware reads byte 0 of each thread's
+                // scale VGPR.
+                //
+                // The scale matrix Ax has shape [M=16, K/32=4] — one scale per
+                // (row, K-group). Each thread at (lane_row, lane_kgrp) holds
+                // Ax[lane_row, lane_kgrp] = ONE scale value for its own K-group.
+                // We place that single byte in byte 0 of the int32.
+                //
                 // This MFMA covers FP4 elements [mfma_idx*128 .. mfma_idx*128+127]
-                // With block_size=32 FP4 elements, that's scale blocks:
-                //   [mfma_idx*4 + 0], [mfma_idx*4 + 1], [mfma_idx*4 + 2], [mfma_idx*4 + 3]
-                // But the last MFMA (mfma_idx=4) starts at FP4 elem 512, covering 512..639
-                // Only 576-512=64 FP4 elements are valid => scale blocks 16, 17 are valid, 18,19 don't exist
-                int scale_block_base = mfma_idx * 4;
+                // With block_size=32, that's scale blocks [mfma_idx*4 + 0..3].
+                // Thread with lane_kgrp=g needs scale block mfma_idx*4 + g.
+                int scale_block_idx = mfma_idx * 4 + lane_kgrp;
 
-                // sa: Q scale for head=lane_row
+                // sa: Q scale for head=lane_row, kgroup=lane_kgrp
                 int sa;
                 {
-                    unsigned int packed_sa = 0;
-                    #pragma unroll
-                    for (int s = 0; s < 4; s++) {
-                        int sb_idx = scale_block_base + s;
-                        unsigned char sv = 0;
-                        if (sb_idx < NUM_SCALE_BLOCKS) {
-                            sv = smem_q_scale[lane_row * SCALE_ROW_STRIDE + sb_idx];
-                        }
-                        packed_sa |= ((unsigned int)sv) << (s * 8);
+                    unsigned char sv = 0;
+                    if (scale_block_idx < NUM_SCALE_BLOCKS) {
+                        sv = smem_q_scale[lane_row * SCALE_ROW_STRIDE + scale_block_idx];
                     }
-                    sa = (int)packed_sa;
+                    sa = (int)sv;  // byte 0 = sv, bytes 1-3 = 0
                 }
 
-                // sb: K scale for token=wave_token_base + lane_row
+                // sb: K scale for token=wave_token_base + lane_row, kgroup=lane_kgrp
                 int sb;
                 {
-                    unsigned int packed_sb = 0;
+                    unsigned char sv = 0;
                     int token_global = kv_start + wave_token_base + lane_row;
-                    if (lane_row < wave_tokens) {
-                        #pragma unroll
-                        for (int s = 0; s < 4; s++) {
-                            int sb_idx = scale_block_base + s;
-                            unsigned char sv = 0;
-                            if (sb_idx < NUM_SCALE_BLOCKS) {
-                                sv = K_scale[(long long)token_global * k_scale_stride + sb_idx];
-                            }
-                            packed_sb |= ((unsigned int)sv) << (s * 8);
-                        }
+                    if (lane_row < wave_tokens && scale_block_idx < NUM_SCALE_BLOCKS) {
+                        sv = K_scale[(long long)token_global * k_scale_stride + scale_block_idx];
                     }
-                    sb = (int)packed_sb;
+                    sb = (int)sv;  // byte 0 = sv, bytes 1-3 = 0
                 }
 
                 // Execute scaled MFMA
