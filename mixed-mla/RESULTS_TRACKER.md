@@ -118,3 +118,11 @@ Same as v24 but bs=256,kv=8192 uses a8w8 pg8 instead of pg1.
 | bs=256, kv=1024 | 53.3 | a16w8 pg2 |
 | bs=256, kv=8192 | 108 | a8w8 pg8 (same as v24's pg1) |
 Note: pg8 didn't improve over pg1 for bs=256,kv=8192.
+
+### MXFP4 MFMA HIP Kernel (correctness: PASS, performance: TOO SLOW)
+- Compiled and ran `v_mfma_scale_f32_16x16x128_f8f6f4` with cbsz=4 blgp=4 via `__builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4`
+- QK scores computed correctly with hardware MXFP4 + E8M0 scales
+- V accumulation is scalar (LUT-based FP8 dequant) — too slow
+- bs=256,kv=8192: 41.6ms (vs AITER 301μs = 138x slower)
+- Needs multi-wave + MFMA for V to be competitive
+- 4.97% mismatch ratio — borderline, fails some recheck seeds
