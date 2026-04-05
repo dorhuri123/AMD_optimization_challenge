@@ -167,11 +167,16 @@ __device__ __forceinline__ float4_vec mfma_scale_fp4(
 __device__ __forceinline__ float4_vec mfma_scale_fp4(
     int4_vec a, int4_vec b, float4_vec c, int sa, int sb
 ) {
+    // The instruction encoding always reads 8 VGPRs for srcA/srcB (sized for FP8).
+    // With cbsz=4 (FP4) only the first 4 are used, but we must allocate all 8
+    // to avoid reading garbage from adjacent registers.
+    int8_vec a_pad = {a[0], a[1], a[2], a[3], 0, 0, 0, 0};
+    int8_vec b_pad = {b[0], b[1], b[2], b[3], 0, 0, 0, 0};
     float4_vec result = c;
     asm volatile(
         "v_mfma_scale_f32_16x16x128_f8f6f4 %0, %1, %2, %0, %3, %4 op_sel_hi:[0,0,0] cbsz:4 blgp:4"
         : "+v"(result)
-        : "v"(a), "v"(b), "v"(sa), "v"(sb)
+        : "v"(a_pad), "v"(b_pad), "v"(sa), "v"(sb)
     );
     return result;
 }
