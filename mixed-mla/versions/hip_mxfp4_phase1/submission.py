@@ -126,6 +126,8 @@ hip_source = r"""
 // ---------------------------------------------------------------
 // For FP4 (cbsz=4): srcA/srcB are 4 x int32 (16 bytes = 32 FP4 elements per kgroup)
 // The instruction takes 8 x int32 but only reads first 4 for FP4.
+// Try the compiler builtin first — it handles register shrinking automatically.
+#define USE_SCALED_MFMA_BUILTIN 1
 typedef int    int4_vec   __attribute__((ext_vector_type(4)));
 typedef int    int8_vec   __attribute__((ext_vector_type(8)));
 typedef float  float4_vec __attribute__((ext_vector_type(4)));
