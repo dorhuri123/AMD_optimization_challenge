@@ -1,18 +1,13 @@
 """
-v29: Non-persistent splits=1 for bs=256,kv=8192 — skips reduce kernel entirely.
+sweep_test05: a16w8 pg4 for (256,8192), splits=16.
 
-Path A: MXFP4 Triton (small configs)
-  {(4,1024), (4,8192), (32,1024)}
-  dot_scaled QK with e2m1, bf16 V accumulation
+Same 3-way routing as v24:
+  Path A: MXFP4 Triton for small configs
+  Path B: a16w8 pg2 for medium/large
+  Path C: a8w8 pg1 for (256,8192)
 
-Path B: a16w8 + PAGE_SIZE=2 (medium/large configs)
-  {(32,8192), (64,1024), (64,8192), (256,1024)}
-  bf16 Q (no quant), fp8 KV, paged kv_indptr
-
-Path C: NON-PERSISTENT splits=1 (bs=256, kv=8192 only)
-  fp8 Q + fp8 KV, page_size=1, NO work_meta_data
-  AITER auto-picks splits=1, aliases logits=output, skips reduce kernel
-  Expected: 300->160 us for this config
+Added: HIP_FORCE_DEV_KERNARG, GPU_MAX_HW_QUEUES, TRITON_HIP_USE_BLOCK_PINGPONG
+Changed: fast_mode=True in all metadata calls
 """
 
 import os
@@ -61,11 +56,12 @@ MXFP4_KV_SPLITS = {
 }
 
 # Path B: a16w8 + PAGE_SIZE=2
-A16W8_PG2_CONFIGS = {(32, 8192), (64, 1024), (64, 8192), (256, 1024)}
+A16W8_PG2_CONFIGS = {(32, 8192), (64, 1024), (64, 8192), (256, 1024), (256, 8192)}
 # splits: 8 if total_kv<=4096 else 16
+A16W8_PAGE_SIZE = {(256, 8192): 4}  # default PAGE_SIZE_2=2
 
-# Path C: non-persistent splits=1 — only (256, 8192)
-# No explicit splits needed — AITER auto-computes
+# Path C: a8w8 + PAGE_SIZE=1 — only (256, 8192)
+A8W8_SPLITS = 24
 
 # ===============================================================
 # CACHES
@@ -73,7 +69,7 @@ A16W8_PG2_CONFIGS = {(32, 8192), (64, 1024), (64, 8192), (256, 1024)}
 
 _mxfp4_buf_cache: dict = {}
 _a16w8_meta_cache: dict = {}
-_nonpersist_cache: dict = {}
+_a8w8_meta_cache: dict = {}
 _output_cache: dict = {}
 
 
@@ -168,7 +164,7 @@ def _mla_mxfp4_stage1(
             ks_offs = k_scale_start + tl.arange(0, 4)
             k_scale_chunk = tl.load(
                 K_scale_ptr + kv_idx[:, None] * stride_kv_scale + ks_offs[None, :],
-                mask=mask_kv[:, None] & (qs_offs[None, :] < 18),
+                mask=mask_kv[:, None] & (ks_offs[None, :] < 18),
                 other=0,
             )
 
@@ -351,23 +347,23 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
 
 PAGE_SIZE_2 = 2
 
-def _get_a16w8_pg2_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr):
-    key = (batch_size, kv_seq_len, num_kv_splits)
+def _get_a16w8_pg2_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr, use_fast_mode=True, page_size=2):
+    key = (batch_size, kv_seq_len, num_kv_splits, use_fast_mode, page_size)
     if key not in _a16w8_meta_cache:
         seq_lens_kv = kv_indptr[1:] - kv_indptr[:-1]
-        num_pages_per_req = (seq_lens_kv + PAGE_SIZE_2 - 1) // PAGE_SIZE_2
+        num_pages_per_req = (seq_lens_kv + page_size - 1) // page_size
         kv_indptr_paged = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
         kv_indptr_paged[1:] = torch.cumsum(num_pages_per_req, dim=0)
 
-        kv_last_page_lens = (seq_lens_kv % PAGE_SIZE_2).to(torch.int32)
-        kv_last_page_lens = torch.where(kv_last_page_lens == 0, PAGE_SIZE_2, kv_last_page_lens)
+        kv_last_page_lens = (seq_lens_kv % page_size).to(torch.int32)
+        kv_last_page_lens = torch.where(kv_last_page_lens == 0, page_size, kv_last_page_lens)
 
         total_pages = int(kv_indptr_paged[-1].item())
-        kv_granularity = max(1, 16 // PAGE_SIZE_2)  # 8
+        kv_granularity = max(1, 16 // page_size)
 
         info = get_mla_metadata_info_v1(
             batch_size, 1, NUM_HEADS, torch.bfloat16, FP8_DTYPE,
-            is_sparse=False, fast_mode=False,
+            is_sparse=False, fast_mode=use_fast_mode,
             num_kv_splits=num_kv_splits, intra_batch_mode=True,
         )
         work = [torch.empty(s, dtype=t, device="cuda") for s, t in info]
@@ -377,11 +373,11 @@ def _get_a16w8_pg2_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_ind
             qo_indptr, kv_indptr_paged, kv_last_page_lens,
             NUM_HEADS // NUM_KV_HEADS, NUM_KV_HEADS, True,
             wm, wis, wi, ri, rfm, rpm,
-            page_size=PAGE_SIZE_2,
+            page_size=page_size,
             kv_granularity=kv_granularity,
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
-            fast_mode=False,
+            fast_mode=use_fast_mode,
             max_split_per_batch=num_kv_splits,
             intra_batch_mode=True,
             dtype_q=torch.bfloat16,
@@ -401,9 +397,13 @@ def _a16w8_pg2_path(q, kv_data, qo_indptr, kv_indptr, config):
 
     total_kv = batch_size * kv_seq_len
     num_kv_splits = 8 if total_kv <= 4096 else 16
+    page_size = A16W8_PAGE_SIZE.get((batch_size, kv_seq_len), PAGE_SIZE_2)
+
+    # fast_mode=True for all EXCEPT bs=64,kv=1024 (failed recheck in v26)
+    use_fast = not (batch_size == 64 and kv_seq_len == 1024)
 
     (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_lens, kv_indptr_paged) = \
-        _get_a16w8_pg2_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr)
+        _get_a16w8_pg2_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr, use_fast_mode=use_fast, page_size=page_size)
 
     out_key = (batch_size, NUM_HEADS)
     if out_key not in _output_cache:
@@ -413,14 +413,14 @@ def _a16w8_pg2_path(q, kv_data, qo_indptr, kv_indptr, config):
     o = _output_cache[out_key]
 
     kv_buffer_fp8, kv_scale = kv_data["fp8"]
-    num_pages = total_kv // PAGE_SIZE_2
-    kv_buffer_4d = kv_buffer_fp8.view(num_pages, PAGE_SIZE_2, NUM_KV_HEADS, kv_buffer_fp8.shape[-1])
+    num_pages = total_kv // page_size
+    kv_buffer_4d = kv_buffer_fp8.view(num_pages, page_size, NUM_KV_HEADS, kv_buffer_fp8.shape[-1])
 
     mla_decode_fwd(
         q, kv_buffer_4d, o,
         qo_indptr, kv_indptr_paged, kv_indices, kv_last_page_lens,
         1,
-        page_size=PAGE_SIZE_2,
+        page_size=page_size,
         nhead_kv=NUM_KV_HEADS,
         sm_scale=SM_SCALE,
         logit_cap=0.0,
@@ -435,7 +435,7 @@ def _a16w8_pg2_path(q, kv_data, qo_indptr, kv_indptr, config):
 
 
 # ===============================================================
-# PATH C: NON-PERSISTENT splits=1 for bs=256,kv=8192
+# PATH C: a8w8 + PAGE_SIZE=1
 # ===============================================================
 
 PAGE_SIZE_1 = 1
@@ -448,37 +448,56 @@ def quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return fp8_tensor, scale.to(torch.float32).reshape(1)
 
 
-def _get_nonpersist_cached(batch_size, kv_seq_len, kv_indptr, device):
-    """Cache kv_indices, kv_last_page_len, and output for non-persistent path."""
-    key = (batch_size, kv_seq_len)
-    if key not in _nonpersist_cache:
-        total_kv = batch_size * kv_seq_len
+def _get_a8w8_meta(batch_size, num_kv_splits, q_dtype, kv_dtype, qo_indptr, kv_indptr):
+    key = (batch_size, num_kv_splits, q_dtype, kv_dtype)
+    if key not in _a8w8_meta_cache:
         kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
-        kv_indices = torch.arange(total_kv, dtype=torch.int32, device=device)
-        _nonpersist_cache[key] = (kv_indices, kv_last_page_len)
-    return _nonpersist_cache[key]
+        total_kv = int(kv_indptr[-1].item())
+        kv_indices = torch.arange(total_kv, dtype=torch.int32, device="cuda")
+
+        info = get_mla_metadata_info_v1(
+            batch_size, 1, NUM_HEADS, q_dtype, kv_dtype,
+            is_sparse=False, fast_mode=True,
+            num_kv_splits=num_kv_splits, intra_batch_mode=True,
+        )
+        work = [torch.empty(s, dtype=t, device="cuda") for s, t in info]
+        (wm, wi, wis, ri, rfm, rpm) = work
+
+        get_mla_metadata_v1(
+            qo_indptr, kv_indptr, kv_last_page_len,
+            NUM_HEADS // NUM_KV_HEADS, NUM_KV_HEADS, True,
+            wm, wis, wi, ri, rfm, rpm,
+            page_size=PAGE_SIZE_1,
+            kv_granularity=max(PAGE_SIZE_1, 16),
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=True,
+            max_split_per_batch=num_kv_splits,
+            intra_batch_mode=True,
+            dtype_q=q_dtype,
+            dtype_kv=kv_dtype,
+        )
+
+        _a8w8_meta_cache[key] = (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_len)
+
+    return _a8w8_meta_cache[key]
 
 
-def _nonpersist_splits1_path(q, kv_data, qo_indptr, kv_indptr, config):
-    """Path C: Non-persistent splits=1 for bs=256,kv=8192 — skips reduce entirely.
-
-    When num_kv_splits=1 AND fp8 dtype, AITER's non-persistent path aliases
-    logits directly onto the output tensor. Stage1 writes the final result.
-    NO reduce kernel needed. 256 batches already fill 256 CUs.
-    """
+def _a8w8_path(q, kv_data, qo_indptr, kv_indptr, config):
+    """Path C: fp8 Q + fp8 KV, page_size=1 for bs=256,kv=8192."""
     batch_size = config["batch_size"]
-    kv_seq_len = config["kv_seq_len"]
+    num_kv_splits = A8W8_SPLITS  # 24
 
     q_fp8, q_scale = quantize_fp8(q)
     kv_fp8, kv_scale = kv_data["fp8"]
 
-    kv_4d = kv_fp8.view(kv_fp8.shape[0], PAGE_SIZE_1, NUM_KV_HEADS, kv_fp8.shape[-1])
+    (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_len) = \
+        _get_a8w8_meta(
+            batch_size, num_kv_splits,
+            q_fp8.dtype, kv_fp8.dtype,
+            qo_indptr, kv_indptr,
+        )
 
-    kv_indices, kv_last_page_len = _get_nonpersist_cached(
-        batch_size, kv_seq_len, kv_indptr, q.device,
-    )
-
-    # Get or cache output buffer
     out_key = (batch_size, NUM_HEADS)
     if out_key not in _output_cache:
         _output_cache[out_key] = torch.empty(
@@ -486,24 +505,24 @@ def _nonpersist_splits1_path(q, kv_data, qo_indptr, kv_indptr, config):
         )
     o = _output_cache[out_key]
 
-    # NON-PERSISTENT call: no work_meta_data, no num_kv_splits
-    # AITER's get_meta_param auto-computes splits.
-    # For bs=256,kv=8192: formula picks splits=1.
-    # With splits=1 + fp8 dtype: logits aliases output, reduce kernel skipped.
+    kv_4d = kv_fp8.view(kv_fp8.shape[0], PAGE_SIZE_1, NUM_KV_HEADS, kv_fp8.shape[-1])
+
     mla_decode_fwd(
         q_fp8.view(-1, NUM_HEADS, QK_HEAD_DIM),
         kv_4d, o,
         qo_indptr, kv_indptr,
         kv_indices, kv_last_page_len,
-        1,  # max_seqlen_q
+        1,
         page_size=PAGE_SIZE_1,
         nhead_kv=NUM_KV_HEADS,
         sm_scale=SM_SCALE,
         logit_cap=0.0,
+        num_kv_splits=num_kv_splits,
         q_scale=q_scale,
         kv_scale=kv_scale,
-        # NO work_meta_data → non-persistent path
-        # NO num_kv_splits → AITER auto-computes (picks 1 for bs=256)
+        intra_batch_mode=True,
+        work_meta_data=wm, work_indptr=wi, work_info_set=wis,
+        reduce_indptr=ri, reduce_final_map=rfm, reduce_partial_map=rpm,
     )
     return o
 
@@ -522,5 +541,5 @@ def custom_kernel(data: input_t) -> output_t:
     elif (bs, kvlen) in A16W8_PG2_CONFIGS:
         return _a16w8_pg2_path(q, kv_data, qo_indptr, kv_indptr, config)
     else:
-        # (256, 8192) — non-persistent splits=1, skips reduce kernel
-        return _nonpersist_splits1_path(q, kv_data, qo_indptr, kv_indptr, config)
+        # (256, 8192) — a8w8 path
+        return _a8w8_path(q, kv_data, qo_indptr, kv_indptr, config)
