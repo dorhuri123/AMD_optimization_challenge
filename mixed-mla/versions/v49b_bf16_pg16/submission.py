@@ -1,17 +1,18 @@
 """
-v43: Best-of-both hybrid combining MXFP4 Triton (small configs) with a8w8 pg8 (large configs).
+v49: bf16 Q + bf16 KV with page_size=64 for ALL kv=8192 configs.
+
+Key insight: dgavriloff achieved 21.9us with bf16 pg64. Our a8w8 pg8 gives 28-81us on kv=8192.
+bf16 with large page_size=64 massively reduces page table overhead.
 
 Routing:
-  (4,1024):   MXFP4 Triton splits=4   -> 20.9us
-  (32,1024):  MXFP4 Triton splits=4   -> 29.7us
-  (64,1024):  a16w8 pg1 splits=8       -> 39.9us  (safe from pg2 seed failure)
-  (256,1024): a16w8 pg2 splits=16      -> 54.3us
-  (4,8192):   a8w8 pg8 splits=8        -> 27.7us
-  (32,8192):  a8w8 pg8 splits=16       -> 33.4us
-  (64,8192):  a8w8 pg8 splits=16       -> 41.0us
-  (256,8192): a8w8 pg8 splits=16       -> 79.7us
-
-Expected geomean: ~36.4us
+  (4,1024):   MXFP4 Triton splits=4   -> ~21us
+  (32,1024):  MXFP4 Triton splits=4   -> ~30us
+  (64,1024):  a16w8 pg8 splits=8       -> NEW (try pg8 instead of pg1)
+  (256,1024): a16w8 pg2 splits=16      -> ~54us
+  (4,8192):   bf16 pg64 splits=32      -> NEW! (target ~22us)
+  (32,8192):  bf16 pg64 splits=32      -> NEW!
+  (64,8192):  bf16 pg64 splits=32      -> NEW!
+  (256,8192): bf16 pg64 splits=32      -> NEW!
 """
 
 import torch
@@ -42,12 +43,12 @@ PACKED_QK: int = 288       # 576 / 2 packed bytes
 NUM_SCALES: int = 18       # 576 / 32 scale blocks
 
 # Page sizes
-PAGE_SIZE_1 = 1
 PAGE_SIZE_2 = 2
 PAGE_SIZE_8 = 8
+PAGE_SIZE_64 = 16
 
 # ===============================================================
-# FIXED-AMAX FP8 QUANTIZATION (for a8w8 paths)
+# FIXED-AMAX FP8 QUANTIZATION (for a16w8 paths)
 # ===============================================================
 
 _FP8_FINFO = torch.finfo(FP8_DTYPE)
@@ -77,31 +78,31 @@ def quantize_fp8_fixed(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 # ROUTING TABLE
 # ===============================================================
 
-# Path A: MXFP4 Triton — fastest for small kv=1024 configs
+# Path A: MXFP4 Triton -- fastest for small kv=1024 configs
 MXFP4_CONFIGS = {(4, 1024), (32, 1024)}
 MXFP4_KV_SPLITS = {
     (4, 1024): 4,
     (32, 1024): 4,
 }
 
-# Path B: a16w8 pg1 — safe for (64,1024), avoids pg2 seed failure
-A16W8_PG1_CONFIGS = {(64, 1024)}
-A16W8_PG1_SPLITS = {
+# Path B: a16w8 pg8 -- for (64,1024)
+A16W8_PG8_CONFIGS = {(64, 1024)}
+A16W8_PG8_SPLITS = {
     (64, 1024): 8,
 }
 
-# Path C: a16w8 pg2 — fast for (256,1024)
+# Path C: a16w8 pg2 -- fast for (256,1024)
 A16W8_PG2_CONFIGS = {(256, 1024)}
 A16W8_PG2_SPLITS = {
     (256, 1024): 16,
 }
 
-# Path D: a8w8 pg8 — all kv=8192 configs
-A8W8_PG8_SPLITS = {
-    (4, 8192): 8,
-    (32, 8192): 16,
-    (64, 8192): 16,
-    (256, 8192): 16,
+# Path D: bf16 pg64 -- ALL kv=8192 configs (the big win!)
+BF16_PG64_SPLITS = {
+    (4, 8192): 32,
+    (32, 8192): 32,
+    (64, 8192): 32,
+    (256, 8192): 32,
 }
 
 # ===============================================================
@@ -109,10 +110,22 @@ A8W8_PG8_SPLITS = {
 # ===============================================================
 
 _mxfp4_buf_cache: dict = {}
-_a16w8_pg1_meta_cache: dict = {}
+_a16w8_pg8_meta_cache: dict = {}
 _a16w8_pg2_meta_cache: dict = {}
-_a8w8_pg8_meta_cache: dict = {}
+_bf16_pg64_meta_cache: dict = {}
 _output_cache: dict = {}
+
+
+# ===============================================================
+# SHARED OUTPUT HELPER
+# ===============================================================
+
+def _get_output(batch_size, device):
+    out_key = (batch_size, NUM_HEADS)
+    if out_key not in _output_cache:
+        _output_cache[out_key] = torch.empty(
+            (batch_size, NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16, device=device)
+    return _output_cache[out_key]
 
 
 # ===============================================================
@@ -342,13 +355,7 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
     num_v_chunks = V_HEAD_DIM // V_CHUNK_D  # 4
 
     bufs = _get_mxfp4_buffers(batch_size, num_kv_splits, q.device)
-
-    out_key = (batch_size, NUM_HEADS)
-    if out_key not in _output_cache:
-        _output_cache[out_key] = torch.empty(
-            (batch_size, NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16, device=q.device,
-        )
-    o = _output_cache[out_key]
+    o = _get_output(batch_size, q.device)
 
     grid1 = (batch_size * num_kv_splits, 1, num_v_chunks)
     _mla_mxfp4_stage1[grid1](
@@ -383,60 +390,85 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
 
 
 # ===============================================================
-# PATH B: a16w8 pg1 (for (64,1024))
+# PATH B: a16w8 pg8 (for (64,1024))
 # ===============================================================
 
-def _get_a16w8_pg1_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr):
-    key = (batch_size, kv_seq_len, num_kv_splits)
-    if key not in _a16w8_pg1_meta_cache:
-        kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
-        total_kv = int(kv_indptr[-1].item())
-        kv_indices = torch.arange(total_kv, dtype=torch.int32, device="cuda")
+def _get_a16w8_pg8_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr):
+    key = ("a16w8_pg8", batch_size, kv_seq_len, num_kv_splits)
+    if key not in _a16w8_pg8_meta_cache:
+        seq_lens_kv = kv_indptr[1:] - kv_indptr[:-1]
+
+        # Convert to paged kv_indptr for page_size=8
+        num_pages_per_req = (seq_lens_kv + PAGE_SIZE_8 - 1) // PAGE_SIZE_8
+        kv_indptr_paged = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+        kv_indptr_paged[1:] = torch.cumsum(num_pages_per_req, dim=0)
+
+        kv_last_page_lens = (seq_lens_kv % PAGE_SIZE_8).to(torch.int32)
+        kv_last_page_lens = torch.where(kv_last_page_lens == 0, PAGE_SIZE_8, kv_last_page_lens)
+
+        total_pages = int(kv_indptr_paged[-1].item())
+        kv_granularity = max(1, 16 // PAGE_SIZE_8)  # 2
+
         info = get_mla_metadata_info_v1(
             batch_size, 1, NUM_HEADS, torch.bfloat16, FP8_DTYPE,
             is_sparse=False, fast_mode=False,
-            num_kv_splits=num_kv_splits, intra_batch_mode=True)
+            num_kv_splits=num_kv_splits, intra_batch_mode=True,
+        )
         work = [torch.empty(s, dtype=t, device="cuda") for s, t in info]
         (wm, wi, wis, ri, rfm, rpm) = work
+
         get_mla_metadata_v1(
-            qo_indptr, kv_indptr, kv_last_page_len,
+            qo_indptr, kv_indptr_paged, kv_last_page_lens,
             NUM_HEADS // NUM_KV_HEADS, NUM_KV_HEADS, True,
             wm, wis, wi, ri, rfm, rpm,
-            page_size=PAGE_SIZE_1, kv_granularity=16,
-            max_seqlen_qo=1, uni_seqlen_qo=1, fast_mode=False,
-            max_split_per_batch=num_kv_splits, intra_batch_mode=True,
-            dtype_q=torch.bfloat16, dtype_kv=FP8_DTYPE)
-        _a16w8_pg1_meta_cache[key] = (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_len)
-    return _a16w8_pg1_meta_cache[key]
+            page_size=PAGE_SIZE_8,
+            kv_granularity=kv_granularity,
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=False,
+            max_split_per_batch=num_kv_splits,
+            intra_batch_mode=True,
+            dtype_q=torch.bfloat16,
+            dtype_kv=FP8_DTYPE,
+        )
+
+        kv_indices = torch.arange(total_pages, dtype=torch.int32, device="cuda")
+        _a16w8_pg8_meta_cache[key] = (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_lens, kv_indptr_paged)
+
+    return _a16w8_pg8_meta_cache[key]
 
 
-def _a16w8_pg1_path(q, kv_data, qo_indptr, kv_indptr, config):
-    """Path B: bf16 Q + fp8 KV, page_size=1 for (64,1024)."""
+def _a16w8_pg8_path(q, kv_data, qo_indptr, kv_indptr, config):
+    """Path B: bf16 Q + fp8 KV, page_size=8 for (64,1024)."""
     batch_size = config["batch_size"]
     kv_seq_len = config["kv_seq_len"]
-    num_kv_splits = A16W8_PG1_SPLITS[(batch_size, kv_seq_len)]
+    num_kv_splits = A16W8_PG8_SPLITS[(batch_size, kv_seq_len)]
 
-    (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_len) = \
-        _get_a16w8_pg1_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr)
+    (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_lens, kv_indptr_paged) = \
+        _get_a16w8_pg8_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr)
 
-    out_key = (batch_size, NUM_HEADS)
-    if out_key not in _output_cache:
-        _output_cache[out_key] = torch.empty(
-            (batch_size, NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16, device=q.device)
-    o = _output_cache[out_key]
+    o = _get_output(batch_size, q.device)
 
-    kv_fp8, kv_scale = kv_data["fp8"]
-    kv_4d = kv_fp8.view(kv_fp8.shape[0], 1, NUM_KV_HEADS, kv_fp8.shape[-1])
+    kv_buffer_fp8, kv_scale = kv_data["fp8"]
+    total_kv = batch_size * kv_seq_len
+    num_pages = total_kv // PAGE_SIZE_8
+    kv_buffer_4d = kv_buffer_fp8.view(num_pages, PAGE_SIZE_8, NUM_KV_HEADS, kv_buffer_fp8.shape[-1])
 
     mla_decode_fwd(
-        q, kv_4d, o,
-        qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
-        1, page_size=PAGE_SIZE_1, nhead_kv=NUM_KV_HEADS,
-        sm_scale=SM_SCALE, logit_cap=0.0, num_kv_splits=num_kv_splits,
-        q_scale=None, kv_scale=kv_scale,
+        q, kv_buffer_4d, o,
+        qo_indptr, kv_indptr_paged, kv_indices, kv_last_page_lens,
+        1,
+        page_size=PAGE_SIZE_8,
+        nhead_kv=NUM_KV_HEADS,
+        sm_scale=SM_SCALE,
+        logit_cap=0.0,
+        num_kv_splits=num_kv_splits,
+        q_scale=None,
+        kv_scale=kv_scale,
         intra_batch_mode=True,
         work_meta_data=wm, work_indptr=wi, work_info_set=wis,
-        reduce_indptr=ri, reduce_final_map=rfm, reduce_partial_map=rpm)
+        reduce_indptr=ri, reduce_final_map=rfm, reduce_partial_map=rpm,
+    )
     return o
 
 
@@ -496,12 +528,7 @@ def _a16w8_pg2_path(q, kv_data, qo_indptr, kv_indptr, config):
     (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_lens, kv_indptr_paged) = \
         _get_a16w8_pg2_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr)
 
-    out_key = (batch_size, NUM_HEADS)
-    if out_key not in _output_cache:
-        _output_cache[out_key] = torch.empty(
-            (batch_size, NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16, device=q.device,
-        )
-    o = _output_cache[out_key]
+    o = _get_output(batch_size, q.device)
 
     kv_buffer_fp8, kv_scale = kv_data["fp8"]
     total_kv = batch_size * kv_seq_len
@@ -527,95 +554,68 @@ def _a16w8_pg2_path(q, kv_data, qo_indptr, kv_indptr, config):
 
 
 # ===============================================================
-# PATH D: a8w8 pg8 (for ALL kv=8192 configs)
+# PATH D: bf16 pg64 (for ALL kv=8192 configs) -- THE BIG WIN!
 # ===============================================================
 
-def _get_a8w8_pg8_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr):
-    key = (batch_size, kv_seq_len, num_kv_splits)
-    if key not in _a8w8_pg8_meta_cache:
+def _get_bf16_pg64_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr):
+    key = ("bf16_pg64", batch_size, kv_seq_len, num_kv_splits)
+    if key not in _bf16_pg64_meta_cache:
         seq_lens_kv = kv_indptr[1:] - kv_indptr[:-1]
-
-        # Convert to paged kv_indptr for page_size=8
-        num_pages_per_req = (seq_lens_kv + PAGE_SIZE_8 - 1) // PAGE_SIZE_8
+        num_pages_per_req = (seq_lens_kv + PAGE_SIZE_64 - 1) // PAGE_SIZE_64
         kv_indptr_paged = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
         kv_indptr_paged[1:] = torch.cumsum(num_pages_per_req, dim=0)
-
-        kv_last_page_lens = (seq_lens_kv % PAGE_SIZE_8).to(torch.int32)
-        kv_last_page_lens = torch.where(kv_last_page_lens == 0, PAGE_SIZE_8, kv_last_page_lens)
-
+        kv_last_page_lens = (seq_lens_kv % PAGE_SIZE_64).to(torch.int32)
+        kv_last_page_lens = torch.where(kv_last_page_lens == 0, PAGE_SIZE_64, kv_last_page_lens)
         total_pages = int(kv_indptr_paged[-1].item())
-        kv_granularity = max(1, 16 // PAGE_SIZE_8)  # 2
+
+        # kv_granularity = max(page_size, 16) = max(64, 16) = 64
+        kv_granularity = 64
 
         info = get_mla_metadata_info_v1(
-            batch_size, 1, NUM_HEADS, FP8_DTYPE, FP8_DTYPE,
-            is_sparse=False, fast_mode=False,
-            num_kv_splits=num_kv_splits, intra_batch_mode=True,
-        )
+            batch_size, 1, NUM_HEADS, torch.bfloat16, torch.bfloat16,  # bf16 for BOTH Q and KV
+            is_sparse=False, fast_mode=True,  # fast_mode=True!
+            num_kv_splits=num_kv_splits, intra_batch_mode=True)
         work = [torch.empty(s, dtype=t, device="cuda") for s, t in info]
         (wm, wi, wis, ri, rfm, rpm) = work
-
         get_mla_metadata_v1(
             qo_indptr, kv_indptr_paged, kv_last_page_lens,
             NUM_HEADS // NUM_KV_HEADS, NUM_KV_HEADS, True,
             wm, wis, wi, ri, rfm, rpm,
-            page_size=PAGE_SIZE_8,
-            kv_granularity=kv_granularity,
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
-            fast_mode=False,
-            max_split_per_batch=num_kv_splits,
-            intra_batch_mode=True,
-            dtype_q=FP8_DTYPE,
-            dtype_kv=FP8_DTYPE,
-        )
-
+            page_size=PAGE_SIZE_64, kv_granularity=kv_granularity,
+            max_seqlen_qo=1, uni_seqlen_qo=1, fast_mode=True,
+            max_split_per_batch=num_kv_splits, intra_batch_mode=True,
+            dtype_q=torch.bfloat16, dtype_kv=torch.bfloat16)
         kv_indices = torch.arange(total_pages, dtype=torch.int32, device="cuda")
-        _a8w8_pg8_meta_cache[key] = (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_lens, kv_indptr_paged)
+        _bf16_pg64_meta_cache[key] = (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_lens, kv_indptr_paged)
+    return _bf16_pg64_meta_cache[key]
 
-    return _a8w8_pg8_meta_cache[key]
 
-
-def _a8w8_pg8_path(q, kv_data, qo_indptr, kv_indptr, config):
-    """Path D: fp8 Q + fp8 KV, page_size=8 for all kv=8192 configs."""
+def _bf16_pg64_path(q, kv_data, qo_indptr, kv_indptr, config):
+    """Path D: bf16 Q + bf16 KV, page_size=64, splits=32 for all kv=8192 configs."""
     batch_size = config["batch_size"]
     kv_seq_len = config["kv_seq_len"]
-    num_kv_splits = A8W8_PG8_SPLITS[(batch_size, kv_seq_len)]
-
-    # Fixed-amax FP8 quantization of Q
-    q_fp8, q_scale = quantize_fp8_fixed(q)
-
-    kv_fp8, kv_scale = kv_data["fp8"]
+    num_kv_splits = BF16_PG64_SPLITS[(batch_size, kv_seq_len)]
+    total_kv = batch_size * kv_seq_len
 
     (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_lens, kv_indptr_paged) = \
-        _get_a8w8_pg8_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr)
+        _get_bf16_pg64_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr)
 
-    out_key = (batch_size, NUM_HEADS)
-    if out_key not in _output_cache:
-        _output_cache[out_key] = torch.empty(
-            (batch_size, NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16, device=q.device,
-        )
-    o = _output_cache[out_key]
+    o = _get_output(batch_size, q.device)
 
-    total_kv = batch_size * kv_seq_len
-    num_pages = total_kv // PAGE_SIZE_8
-    kv_buffer_4d = kv_fp8.view(num_pages, PAGE_SIZE_8, NUM_KV_HEADS, kv_fp8.shape[-1])
+    # bf16 KV buffer -- reshape to paged format [num_pages, PAGE_SIZE_64, NUM_KV_HEADS, QK_HEAD_DIM]
+    kv_bf16 = kv_data["bf16"]  # [total_kv, 1, QK_HEAD_DIM] bf16
+    num_pages = total_kv // PAGE_SIZE_64
+    kv_buffer_4d = kv_bf16.view(num_pages, PAGE_SIZE_64, NUM_KV_HEADS, QK_HEAD_DIM)
 
     mla_decode_fwd(
-        q_fp8.view(-1, NUM_HEADS, QK_HEAD_DIM),
-        kv_buffer_4d, o,
+        q, kv_buffer_4d, o,  # bf16 Q directly, no quantization!
         qo_indptr, kv_indptr_paged, kv_indices, kv_last_page_lens,
-        1,
-        page_size=PAGE_SIZE_8,
-        nhead_kv=NUM_KV_HEADS,
-        sm_scale=SM_SCALE,
-        logit_cap=0.0,
-        num_kv_splits=num_kv_splits,
-        q_scale=q_scale,
-        kv_scale=kv_scale,
+        1, page_size=PAGE_SIZE_64, nhead_kv=NUM_KV_HEADS,
+        sm_scale=SM_SCALE, logit_cap=0.0, num_kv_splits=num_kv_splits,
+        q_scale=None, kv_scale=None,  # no scales for bf16!
         intra_batch_mode=True,
         work_meta_data=wm, work_indptr=wi, work_info_set=wis,
-        reduce_indptr=ri, reduce_final_map=rfm, reduce_partial_map=rpm,
-    )
+        reduce_indptr=ri, reduce_final_map=rfm, reduce_partial_map=rpm)
     return o
 
 
@@ -632,13 +632,13 @@ def custom_kernel(data: input_t) -> output_t:
     if (bs, kvlen) in MXFP4_CONFIGS:
         return _mxfp4_path(q, kv_data, kv_indptr, config)
 
-    # Path B: a16w8 pg1 for (64,1024)
-    if (bs, kvlen) in A16W8_PG1_CONFIGS:
-        return _a16w8_pg1_path(q, kv_data, qo_indptr, kv_indptr, config)
+    # Path B: a16w8 pg8 for (64,1024)
+    if (bs, kvlen) in A16W8_PG8_CONFIGS:
+        return _a16w8_pg8_path(q, kv_data, qo_indptr, kv_indptr, config)
 
     # Path C: a16w8 pg2 for (256,1024)
     if (bs, kvlen) in A16W8_PG2_CONFIGS:
         return _a16w8_pg2_path(q, kv_data, qo_indptr, kv_indptr, config)
 
-    # Path D: a8w8 pg8 for all kv=8192 configs
-    return _a8w8_pg8_path(q, kv_data, qo_indptr, kv_indptr, config)
+    # Path D: bf16 pg64 for ALL kv=8192 configs (the big win!)
+    return _bf16_pg64_path(q, kv_data, qo_indptr, kv_indptr, config)

@@ -1,17 +1,23 @@
 """
-v43: Best-of-both hybrid combining MXFP4 Triton (small configs) with a8w8 pg8 (large configs).
+v55: Per-head MXFP4 Triton kernel for better GPU utilization.
+
+Key change from v43: grid adds NUM_HEADS dimension so each program handles
+ONE head instead of all 16. This gives 16x more parallelism per split.
+
+Old grid (v43):  (batch * splits, 1, V_chunks)  -> e.g. 4*4*4 = 64 programs
+New grid (v55):  (batch * splits, NUM_HEADS, V_chunks) -> e.g. 4*4*16*4 = 1024 programs
+
+Also extends MXFP4 Triton to (64,1024) with splits=8.
 
 Routing:
-  (4,1024):   MXFP4 Triton splits=4   -> 20.9us
-  (32,1024):  MXFP4 Triton splits=4   -> 29.7us
-  (64,1024):  a16w8 pg1 splits=8       -> 39.9us  (safe from pg2 seed failure)
-  (256,1024): a16w8 pg2 splits=16      -> 54.3us
-  (4,8192):   a8w8 pg8 splits=8        -> 27.7us
-  (32,8192):  a8w8 pg8 splits=16       -> 33.4us
-  (64,8192):  a8w8 pg8 splits=16       -> 41.0us
-  (256,8192): a8w8 pg8 splits=16       -> 79.7us
-
-Expected geomean: ~36.4us
+  (4,1024):   MXFP4 Triton perhead splits=4   -> target <20us
+  (32,1024):  MXFP4 Triton perhead splits=4   -> target <29us
+  (64,1024):  MXFP4 Triton perhead splits=8   -> target <37us
+  (256,1024): a16w8 pg2 splits=16             -> 54.3us
+  (4,8192):   a8w8 pg8 splits=8               -> 27.7us
+  (32,8192):  a8w8 pg8 splits=16              -> 33.4us
+  (64,8192):  a8w8 pg8 splits=16              -> 41.0us
+  (256,8192): a8w8 pg8 splits=16              -> 79.7us
 """
 
 import torch
@@ -42,7 +48,6 @@ PACKED_QK: int = 288       # 576 / 2 packed bytes
 NUM_SCALES: int = 18       # 576 / 32 scale blocks
 
 # Page sizes
-PAGE_SIZE_1 = 1
 PAGE_SIZE_2 = 2
 PAGE_SIZE_8 = 8
 
@@ -77,16 +82,11 @@ def quantize_fp8_fixed(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 # ROUTING TABLE
 # ===============================================================
 
-# Path A: MXFP4 Triton — fastest for small kv=1024 configs
-MXFP4_CONFIGS = {(4, 1024), (32, 1024)}
+# Path A: MXFP4 Triton — per-head kernel for small kv=1024 configs
+MXFP4_CONFIGS = {(4, 1024), (32, 1024), (64, 1024)}
 MXFP4_KV_SPLITS = {
     (4, 1024): 4,
     (32, 1024): 4,
-}
-
-# Path B: a16w8 pg1 — safe for (64,1024), avoids pg2 seed failure
-A16W8_PG1_CONFIGS = {(64, 1024)}
-A16W8_PG1_SPLITS = {
     (64, 1024): 8,
 }
 
@@ -109,18 +109,21 @@ A8W8_PG8_SPLITS = {
 # ===============================================================
 
 _mxfp4_buf_cache: dict = {}
-_a16w8_pg1_meta_cache: dict = {}
 _a16w8_pg2_meta_cache: dict = {}
 _a8w8_pg8_meta_cache: dict = {}
 _output_cache: dict = {}
 
 
 # ===============================================================
-# MXFP4 TRITON KERNEL -- STAGE 1
+# MXFP4 PER-HEAD TRITON KERNEL -- STAGE 1
 # ===============================================================
+# Grid: (batch * splits, NUM_HEADS, V_chunks)
+# Each program handles ONE head and ONE V chunk.
+# QK dot_scaled uses M=16 by replicating the single head's Q 16 times
+# (tl.dot_scaled requires M>=16 for MFMA), then we take row 0 of result.
 
 @triton.jit
-def _mla_mxfp4_stage1(
+def _mla_mxfp4_perhead_stage1(
     Q_packed_ptr,     # [batch*16, 288] uint8 (packed e2m1)
     Q_scale_ptr,      # [batch*16, 18] uint8 (e8m0 scales)
     K_packed_ptr,     # [total_kv, 288] uint8 (packed e2m1)
@@ -141,12 +144,13 @@ def _mla_mxfp4_stage1(
     BLOCK_N: tl.constexpr,
     V_CHUNK_D: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
-    NUM_HEADS: tl.constexpr,
+    PAD_M: tl.constexpr,       # padding dimension for dot_scaled (16)
 ):
     LOG2E: tl.constexpr = 1.4426950408889634
 
-    pid_bs = tl.program_id(0)
-    pid_v = tl.program_id(2)
+    pid_bs = tl.program_id(0)   # batch * splits
+    pid_h = tl.program_id(1)    # head index [0..15]
+    pid_v = tl.program_id(2)    # V chunk index [0..3]
 
     pid_b = pid_bs // NUM_KV_SPLITS
     pid_s = pid_bs % NUM_KV_SPLITS
@@ -159,14 +163,19 @@ def _mla_mxfp4_stage1(
     split_kv_start = pid_s * split_size
     split_kv_end = tl.minimum(split_kv_start + split_size, kv_len)
 
-    q_row_base = pid_b * NUM_HEADS
-    offs_m = tl.arange(0, NUM_HEADS)
+    # Q row for this specific head
+    q_row = pid_b * 16 + pid_h
 
     vd_start = pid_v * V_CHUNK_D
 
-    m_prev = tl.full([NUM_HEADS], float("-inf"), dtype=tl.float32)
-    l_prev = tl.zeros([NUM_HEADS], dtype=tl.float32)
-    acc = tl.zeros([NUM_HEADS, V_CHUNK_D], dtype=tl.float32)
+    # Online softmax state for single head
+    m_prev = tl.full([], float("-inf"), dtype=tl.float32)
+    l_prev = tl.full([], 0.0, dtype=tl.float32)
+    acc = tl.zeros([V_CHUNK_D], dtype=tl.float32)
+
+    # Pad dimension for dot_scaled: we replicate Q for 1 head into PAD_M rows
+    # but only use row 0 of the result. PAD_M=16 to satisfy MFMA requirements.
+    offs_pad = tl.arange(0, PAD_M)
 
     num_tiles = tl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
 
@@ -176,26 +185,37 @@ def _mla_mxfp4_stage1(
         mask_kv = kv_offsets < split_kv_end
         kv_idx = kv_start + kv_offsets
 
-        qk = tl.zeros([NUM_HEADS, BLOCK_N], dtype=tl.float32)
+        # QK scores: [PAD_M, BLOCK_N] but only row 0 matters
+        qk = tl.zeros([PAD_M, BLOCK_N], dtype=tl.float32)
 
         for k_tile in tl.static_range(5):
             k_packed_start = k_tile * 64
             k_scale_start = k_tile * 4
 
+            # Load Q packed for this head, broadcast to PAD_M rows
             q_d_offs = k_packed_start + tl.arange(0, 64)
-            q_chunk = tl.load(
-                Q_packed_ptr + (q_row_base + offs_m[:, None]) * stride_q_packed + q_d_offs[None, :],
-                mask=(q_d_offs[None, :] < 288),
+            # [64] -> load 1 row of Q
+            q_single = tl.load(
+                Q_packed_ptr + q_row * stride_q_packed + q_d_offs,
+                mask=(q_d_offs < 288),
                 other=0,
             )
+            # Broadcast to [PAD_M, 64]
+            q_chunk = tl.broadcast_to(q_single[None, :], (PAD_M, 64))
+            # Need to make it a proper 2D tensor for dot_scaled
+            q_chunk = (offs_pad[:, None] * 0).to(tl.uint8) + q_chunk
 
+            # Q scales for this head, broadcast to PAD_M rows
             qs_offs = k_scale_start + tl.arange(0, 4)
-            q_scale_chunk = tl.load(
-                Q_scale_ptr + (q_row_base + offs_m[:, None]) * stride_q_scale + qs_offs[None, :],
-                mask=(qs_offs[None, :] < 18),
+            q_scale_single = tl.load(
+                Q_scale_ptr + q_row * stride_q_scale + qs_offs,
+                mask=(qs_offs < 18),
                 other=0,
             )
+            q_scale_chunk = tl.broadcast_to(q_scale_single[None, :], (PAD_M, 4))
+            q_scale_chunk = (offs_pad[:, None] * 0).to(tl.uint8) + q_scale_chunk
 
+            # K packed: [64, BLOCK_N]
             k_d_offs = k_packed_start + tl.arange(0, 64)
             k_chunk = tl.load(
                 K_packed_ptr + kv_idx[None, :] * stride_kv_packed + k_d_offs[:, None],
@@ -203,6 +223,7 @@ def _mla_mxfp4_stage1(
                 other=0,
             )
 
+            # K scales: [BLOCK_N, 4]
             ks_offs = k_scale_start + tl.arange(0, 4)
             k_scale_chunk = tl.load(
                 K_scale_ptr + kv_idx[:, None] * stride_kv_scale + ks_offs[None, :],
@@ -216,42 +237,47 @@ def _mla_mxfp4_stage1(
                 fast_math=True, acc=qk,
             )
 
-        qk *= sm_scale
-        qk = tl.where(mask_kv[None, :], qk, float("-inf"))
+        # Extract row 0 for our single head: [BLOCK_N]
+        qk_row = tl.sum(qk * (offs_pad[:, None] == 0).to(tl.float32), axis=0)
+        qk_row = qk_row * sm_scale
+        qk_row = tl.where(mask_kv, qk_row, float("-inf"))
 
-        m_new = tl.maximum(m_prev, tl.max(qk, 1))
+        # Online softmax for single head (scalar m, l)
+        m_cur = tl.max(qk_row, 0)
+        m_new = tl.maximum(m_prev, m_cur)
         alpha = tl.math.exp2((m_prev - m_new) * LOG2E)
-        p = tl.math.exp2((qk - m_new[:, None]) * LOG2E)
-        p = tl.where(mask_kv[None, :], p, 0.0)
+        p = tl.math.exp2((qk_row - m_new) * LOG2E)
+        p = tl.where(mask_kv, p, 0.0)
 
-        acc = acc * alpha[:, None]
-        l_prev = l_prev * alpha + tl.sum(p, 1)
+        acc = acc * alpha
+        l_prev = l_prev * alpha + tl.sum(p, 0)
         m_prev = m_new
 
+        # V accumulation: [BLOCK_N] x [BLOCK_N, V_CHUNK_D] -> [V_CHUNK_D]
         vd_offsets = vd_start + tl.arange(0, V_CHUNK_D)
         v_tile = tl.load(
             V_bf16_ptr + kv_idx[:, None] * stride_v_tok + vd_offsets[None, :],
             mask=mask_kv[:, None],
             other=0.0,
         )
-        acc += tl.dot(p.to(tl.bfloat16), v_tile, out_dtype=tl.float32)
+        # p is [BLOCK_N], v_tile is [BLOCK_N, V_CHUNK_D]
+        # We need p @ v_tile = [V_CHUNK_D]
+        acc += tl.sum(p[:, None] * v_tile.to(tl.float32), axis=0)
 
-    po_base = (Partial_O_ptr + pid_b * stride_po_b + pid_s * stride_po_s + vd_start)
-    head_offs = tl.arange(0, NUM_HEADS)
+    # Store partial results
+    po_base = (Partial_O_ptr + pid_b * stride_po_b + pid_s * stride_po_s
+               + pid_h * stride_po_h + vd_start)
     v_offs = tl.arange(0, V_CHUNK_D)
-    tl.store(
-        po_base + head_offs[:, None] * stride_po_h + v_offs[None, :],
-        acc,
-    )
+    tl.store(po_base + v_offs, acc)
 
     if pid_v == 0:
-        ml_base = pid_b * stride_ml_b + pid_s * stride_ml_s
-        tl.store(Partial_m_ptr + ml_base + head_offs * stride_ml_h, m_prev)
-        tl.store(Partial_l_ptr + ml_base + head_offs * stride_ml_h, l_prev)
+        ml_base = pid_b * stride_ml_b + pid_s * stride_ml_s + pid_h * stride_ml_h
+        tl.store(Partial_m_ptr + ml_base, m_prev)
+        tl.store(Partial_l_ptr + ml_base, l_prev)
 
 
 # ===============================================================
-# MXFP4 TRITON KERNEL -- STAGE 2: REDUCE
+# MXFP4 TRITON KERNEL -- STAGE 2: REDUCE (same as v43)
 # ===============================================================
 
 @triton.jit
@@ -295,7 +321,7 @@ def _mla_mxfp4_reduce(
 
 
 # ===============================================================
-# PATH A: MXFP4 TRITON (for (4,1024) and (32,1024))
+# PATH A: MXFP4 TRITON PER-HEAD
 # ===============================================================
 
 def _get_mxfp4_buffers(batch_size, num_kv_splits, device):
@@ -319,7 +345,7 @@ def _get_mxfp4_buffers(batch_size, num_kv_splits, device):
 
 
 def _mxfp4_path(q, kv_data, kv_indptr, config):
-    """Path A: MXFP4 dot_scaled for small configs."""
+    """Path A: MXFP4 per-head dot_scaled for small configs."""
     batch_size = config["batch_size"]
     kv_seq_len = config["kv_seq_len"]
     num_kv_splits = MXFP4_KV_SPLITS[batch_size, kv_seq_len]
@@ -339,6 +365,7 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
 
     BLOCK_N = 64
     V_CHUNK_D = 128
+    PAD_M = 16
     num_v_chunks = V_HEAD_DIM // V_CHUNK_D  # 4
 
     bufs = _get_mxfp4_buffers(batch_size, num_kv_splits, q.device)
@@ -350,8 +377,9 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
         )
     o = _output_cache[out_key]
 
-    grid1 = (batch_size * num_kv_splits, 1, num_v_chunks)
-    _mla_mxfp4_stage1[grid1](
+    # Per-head grid: each program handles 1 head
+    grid1 = (batch_size * num_kv_splits, NUM_HEADS, num_v_chunks)
+    _mla_mxfp4_perhead_stage1[grid1](
         q_packed, q_scale,
         kv_fp4_2d, kv_scale_2d,
         v_bf16_2d,
@@ -365,7 +393,8 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
         SM_SCALE,
         BLOCK_N=BLOCK_N, V_CHUNK_D=V_CHUNK_D,
         NUM_KV_SPLITS=num_kv_splits,
-        NUM_HEADS=NUM_HEADS,
+        PAD_M=PAD_M,
+        num_warps=4, num_stages=2,
     )
 
     grid2 = (batch_size, NUM_HEADS, num_v_chunks)
@@ -379,64 +408,6 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
         NUM_HEADS=NUM_HEADS,
     )
 
-    return o
-
-
-# ===============================================================
-# PATH B: a16w8 pg1 (for (64,1024))
-# ===============================================================
-
-def _get_a16w8_pg1_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr):
-    key = (batch_size, kv_seq_len, num_kv_splits)
-    if key not in _a16w8_pg1_meta_cache:
-        kv_last_page_len = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
-        total_kv = int(kv_indptr[-1].item())
-        kv_indices = torch.arange(total_kv, dtype=torch.int32, device="cuda")
-        info = get_mla_metadata_info_v1(
-            batch_size, 1, NUM_HEADS, torch.bfloat16, FP8_DTYPE,
-            is_sparse=False, fast_mode=False,
-            num_kv_splits=num_kv_splits, intra_batch_mode=True)
-        work = [torch.empty(s, dtype=t, device="cuda") for s, t in info]
-        (wm, wi, wis, ri, rfm, rpm) = work
-        get_mla_metadata_v1(
-            qo_indptr, kv_indptr, kv_last_page_len,
-            NUM_HEADS // NUM_KV_HEADS, NUM_KV_HEADS, True,
-            wm, wis, wi, ri, rfm, rpm,
-            page_size=PAGE_SIZE_1, kv_granularity=16,
-            max_seqlen_qo=1, uni_seqlen_qo=1, fast_mode=False,
-            max_split_per_batch=num_kv_splits, intra_batch_mode=True,
-            dtype_q=torch.bfloat16, dtype_kv=FP8_DTYPE)
-        _a16w8_pg1_meta_cache[key] = (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_len)
-    return _a16w8_pg1_meta_cache[key]
-
-
-def _a16w8_pg1_path(q, kv_data, qo_indptr, kv_indptr, config):
-    """Path B: bf16 Q + fp8 KV, page_size=1 for (64,1024)."""
-    batch_size = config["batch_size"]
-    kv_seq_len = config["kv_seq_len"]
-    num_kv_splits = A16W8_PG1_SPLITS[(batch_size, kv_seq_len)]
-
-    (wm, wi, wis, ri, rfm, rpm, kv_indices, kv_last_page_len) = \
-        _get_a16w8_pg1_meta(batch_size, kv_seq_len, num_kv_splits, qo_indptr, kv_indptr)
-
-    out_key = (batch_size, NUM_HEADS)
-    if out_key not in _output_cache:
-        _output_cache[out_key] = torch.empty(
-            (batch_size, NUM_HEADS, V_HEAD_DIM), dtype=torch.bfloat16, device=q.device)
-    o = _output_cache[out_key]
-
-    kv_fp8, kv_scale = kv_data["fp8"]
-    kv_4d = kv_fp8.view(kv_fp8.shape[0], 1, NUM_KV_HEADS, kv_fp8.shape[-1])
-
-    mla_decode_fwd(
-        q, kv_4d, o,
-        qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
-        1, page_size=PAGE_SIZE_1, nhead_kv=NUM_KV_HEADS,
-        sm_scale=SM_SCALE, logit_cap=0.0, num_kv_splits=num_kv_splits,
-        q_scale=None, kv_scale=kv_scale,
-        intra_batch_mode=True,
-        work_meta_data=wm, work_indptr=wi, work_info_set=wis,
-        reduce_indptr=ri, reduce_final_map=rfm, reduce_partial_map=rpm)
     return o
 
 
@@ -628,13 +599,9 @@ def custom_kernel(data: input_t) -> output_t:
     bs = config["batch_size"]
     kvlen = config["kv_seq_len"]
 
-    # Path A: MXFP4 Triton for (4,1024) and (32,1024)
+    # Path A: MXFP4 Triton per-head for (4,1024), (32,1024), (64,1024)
     if (bs, kvlen) in MXFP4_CONFIGS:
         return _mxfp4_path(q, kv_data, kv_indptr, config)
-
-    # Path B: a16w8 pg1 for (64,1024)
-    if (bs, kvlen) in A16W8_PG1_CONFIGS:
-        return _a16w8_pg1_path(q, kv_data, qo_indptr, kv_indptr, config)
 
     # Path C: a16w8 pg2 for (256,1024)
     if (bs, kvlen) in A16W8_PG2_CONFIGS:

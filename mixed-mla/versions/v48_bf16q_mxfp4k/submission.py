@@ -1,17 +1,19 @@
 """
-v43: Best-of-both hybrid combining MXFP4 Triton (small configs) with a8w8 pg8 (large configs).
+v48: bf16 Q x MXFP4 K in Triton dot_scaled -- eliminates Q quantization entirely.
 
-Routing:
-  (4,1024):   MXFP4 Triton splits=4   -> 20.9us
-  (32,1024):  MXFP4 Triton splits=4   -> 29.7us
-  (64,1024):  a16w8 pg1 splits=8       -> 39.9us  (safe from pg2 seed failure)
-  (256,1024): a16w8 pg2 splits=16      -> 54.3us
-  (4,8192):   a8w8 pg8 splits=8        -> 27.7us
-  (32,8192):  a8w8 pg8 splits=16       -> 33.4us
-  (64,8192):  a8w8 pg8 splits=16       -> 41.0us
-  (256,8192): a8w8 pg8 splits=16       -> 79.7us
+Key change: Instead of quantizing Q to MXFP4 then doing e2m1 x e2m1 dot_scaled,
+we pass bf16 Q directly with format "bf16" x "e2m1". This skips the ~40us
+dynamic_mxfp4_quant call for Q and may improve accuracy.
 
-Expected geomean: ~36.4us
+Routing (same as v43, just MXFP4 kernel uses bf16 Q):
+  (4,1024):   MXFP4 bf16Q Triton splits=4
+  (32,1024):  MXFP4 bf16Q Triton splits=4
+  (64,1024):  a16w8 pg1 splits=8
+  (256,1024): a16w8 pg2 splits=16
+  (4,8192):   a8w8 pg8 splits=8
+  (32,8192):  a8w8 pg8 splits=16
+  (64,8192):  a8w8 pg8 splits=16
+  (256,8192): a8w8 pg8 splits=16
 """
 
 import torch
@@ -22,7 +24,6 @@ from task import input_t, output_t
 from aiter.mla import mla_decode_fwd
 from aiter import dtypes as aiter_dtypes
 from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
-from aiter.utility.fp4_utils import dynamic_mxfp4_quant
 
 # ===============================================================
 # CONSTANTS
@@ -37,7 +38,7 @@ V_HEAD_DIM: int = 512   # KV_LORA_RANK
 SM_SCALE: float = 1.0 / (QK_HEAD_DIM ** 0.5)
 FP8_DTYPE = aiter_dtypes.fp8
 
-# MXFP4 layout constants
+# MXFP4 layout constants (for K only now)
 PACKED_QK: int = 288       # 576 / 2 packed bytes
 NUM_SCALES: int = 18       # 576 / 32 scale blocks
 
@@ -77,26 +78,26 @@ def quantize_fp8_fixed(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 # ROUTING TABLE
 # ===============================================================
 
-# Path A: MXFP4 Triton — fastest for small kv=1024 configs
+# Path A: MXFP4 Triton with bf16 Q -- fastest for small kv=1024 configs
 MXFP4_CONFIGS = {(4, 1024), (32, 1024)}
 MXFP4_KV_SPLITS = {
     (4, 1024): 4,
     (32, 1024): 4,
 }
 
-# Path B: a16w8 pg1 — safe for (64,1024), avoids pg2 seed failure
+# Path B: a16w8 pg1 -- safe for (64,1024), avoids pg2 seed failure
 A16W8_PG1_CONFIGS = {(64, 1024)}
 A16W8_PG1_SPLITS = {
     (64, 1024): 8,
 }
 
-# Path C: a16w8 pg2 — fast for (256,1024)
+# Path C: a16w8 pg2 -- fast for (256,1024)
 A16W8_PG2_CONFIGS = {(256, 1024)}
 A16W8_PG2_SPLITS = {
     (256, 1024): 16,
 }
 
-# Path D: a8w8 pg8 — all kv=8192 configs
+# Path D: a8w8 pg8 -- all kv=8192 configs
 A8W8_PG8_SPLITS = {
     (4, 8192): 8,
     (32, 8192): 16,
@@ -116,13 +117,12 @@ _output_cache: dict = {}
 
 
 # ===============================================================
-# MXFP4 TRITON KERNEL -- STAGE 1
+# MXFP4 TRITON KERNEL -- STAGE 1 (bf16 Q x MXFP4 K)
 # ===============================================================
 
 @triton.jit
 def _mla_mxfp4_stage1(
-    Q_packed_ptr,     # [batch*16, 288] uint8 (packed e2m1)
-    Q_scale_ptr,      # [batch*16, 18] uint8 (e8m0 scales)
+    Q_bf16_ptr,       # [batch*16, 576] bf16 (Q in native bf16, no quantization)
     K_packed_ptr,     # [total_kv, 288] uint8 (packed e2m1)
     K_scale_ptr,      # [total_kv, 18] uint8 (e8m0 scales)
     V_bf16_ptr,       # [total_kv, 576] bf16 (first 512 dims used)
@@ -130,8 +130,7 @@ def _mla_mxfp4_stage1(
     Partial_m_ptr,    # [batch, splits, 16] f32
     Partial_l_ptr,    # [batch, splits, 16] f32
     kv_indptr_ptr,    # [batch+1] i32
-    stride_q_packed,
-    stride_q_scale,
+    stride_q_bf16,
     stride_kv_packed,
     stride_kv_scale,
     stride_v_tok,
@@ -178,24 +177,19 @@ def _mla_mxfp4_stage1(
 
         qk = tl.zeros([NUM_HEADS, BLOCK_N], dtype=tl.float32)
 
+        # 5 tiles of 128 bf16 dims each = 576 dims total (last tile partial: 576-512=64 dims padded to 128)
+        # For K: 128 e2m1 values = 64 packed bytes per tile, 4 scale groups per tile
         for k_tile in tl.static_range(5):
-            k_packed_start = k_tile * 64
-            k_scale_start = k_tile * 4
-
-            q_d_offs = k_packed_start + tl.arange(0, 64)
+            # bf16 Q: load 128 elements per tile from the 576-dim Q vector
+            q_d_offs = k_tile * 128 + tl.arange(0, 128)
             q_chunk = tl.load(
-                Q_packed_ptr + (q_row_base + offs_m[:, None]) * stride_q_packed + q_d_offs[None, :],
-                mask=(q_d_offs[None, :] < 288),
-                other=0,
+                Q_bf16_ptr + (q_row_base + offs_m[:, None]) * stride_q_bf16 + q_d_offs[None, :],
+                mask=(q_d_offs[None, :] < 576),
+                other=0.0,
             )
 
-            qs_offs = k_scale_start + tl.arange(0, 4)
-            q_scale_chunk = tl.load(
-                Q_scale_ptr + (q_row_base + offs_m[:, None]) * stride_q_scale + qs_offs[None, :],
-                mask=(qs_offs[None, :] < 18),
-                other=0,
-            )
-
+            # MXFP4 K: load 64 packed bytes per tile
+            k_packed_start = k_tile * 64
             k_d_offs = k_packed_start + tl.arange(0, 64)
             k_chunk = tl.load(
                 K_packed_ptr + kv_idx[None, :] * stride_kv_packed + k_d_offs[:, None],
@@ -203,6 +197,8 @@ def _mla_mxfp4_stage1(
                 other=0,
             )
 
+            # K scales: 4 e8m0 scale values per tile (128 dims / 32 per group = 4 groups)
+            k_scale_start = k_tile * 4
             ks_offs = k_scale_start + tl.arange(0, 4)
             k_scale_chunk = tl.load(
                 K_scale_ptr + kv_idx[:, None] * stride_kv_scale + ks_offs[None, :],
@@ -210,9 +206,10 @@ def _mla_mxfp4_stage1(
                 other=0,
             )
 
+            # bf16 Q x MXFP4 K dot_scaled: no Q scales needed
             qk = tl.dot_scaled(
-                q_chunk, q_scale_chunk, "e2m1",
-                k_chunk, k_scale_chunk, "e2m1",
+                q_chunk, None, "bf16",           # Q as bf16, no scales
+                k_chunk, k_scale_chunk, "e2m1",  # K as MXFP4 with e8m0 scales
                 fast_math=True, acc=qk,
             )
 
@@ -295,7 +292,7 @@ def _mla_mxfp4_reduce(
 
 
 # ===============================================================
-# PATH A: MXFP4 TRITON (for (4,1024) and (32,1024))
+# PATH A: MXFP4 bf16Q TRITON (for (4,1024) and (32,1024))
 # ===============================================================
 
 def _get_mxfp4_buffers(batch_size, num_kv_splits, device):
@@ -319,7 +316,7 @@ def _get_mxfp4_buffers(batch_size, num_kv_splits, device):
 
 
 def _mxfp4_path(q, kv_data, kv_indptr, config):
-    """Path A: MXFP4 dot_scaled for small configs."""
+    """Path A: bf16 Q x MXFP4 K dot_scaled for small configs (no Q quantization)."""
     batch_size = config["batch_size"]
     kv_seq_len = config["kv_seq_len"]
     num_kv_splits = MXFP4_KV_SPLITS[batch_size, kv_seq_len]
@@ -327,11 +324,8 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
     kv_fp4, kv_scale = kv_data["mxfp4"]
     kv_bf16 = kv_data["bf16"]
 
-    # Quantize Q to MXFP4
-    q_2d = q.view(-1, QK_HEAD_DIM)
-    q_packed_raw, q_scale_raw = dynamic_mxfp4_quant(q_2d)
-    q_packed = q_packed_raw.view(torch.uint8)
-    q_scale = q_scale_raw.view(torch.uint8)
+    # No Q quantization needed! Use bf16 Q directly.
+    q_bf16 = q.view(-1, QK_HEAD_DIM)  # [batch*16, 576] bf16
 
     kv_fp4_2d = kv_fp4.reshape(-1, PACKED_QK).view(torch.uint8)
     kv_scale_2d = kv_scale.view(torch.uint8) if kv_scale.dtype != torch.uint8 else kv_scale
@@ -352,12 +346,12 @@ def _mxfp4_path(q, kv_data, kv_indptr, config):
 
     grid1 = (batch_size * num_kv_splits, 1, num_v_chunks)
     _mla_mxfp4_stage1[grid1](
-        q_packed, q_scale,
+        q_bf16,
         kv_fp4_2d, kv_scale_2d,
         v_bf16_2d,
         bufs["partial_o"], bufs["partial_m"], bufs["partial_l"],
         kv_indptr,
-        q_packed.stride(0), q_scale.stride(0),
+        q_bf16.stride(0),
         kv_fp4_2d.stride(0), kv_scale_2d.stride(0),
         v_bf16_2d.stride(0),
         bufs["partial_o"].stride(0), bufs["partial_o"].stride(1), bufs["partial_o"].stride(2),
@@ -628,7 +622,7 @@ def custom_kernel(data: input_t) -> output_t:
     bs = config["batch_size"]
     kvlen = config["kv_seq_len"]
 
-    # Path A: MXFP4 Triton for (4,1024) and (32,1024)
+    # Path A: MXFP4 bf16Q Triton for (4,1024) and (32,1024)
     if (bs, kvlen) in MXFP4_CONFIGS:
         return _mxfp4_path(q, kv_data, kv_indptr, config)
 
