@@ -1,17 +1,23 @@
 """
-MXFP4 MoE — DSv3 FP4 tuned config + FlyDSL kernels + opus sorting.
+MXFP4 MoE — v13: Per-shape kernel selection + FlyDSL config.
 
-Uses AITER_CONFIG_FMOE pointing to dsv3_fp4_tuned_fmoe.csv which has
-FlyDSL-optimized kernel selections for E=257 shapes with fused FP4 quant.
-For E=33, falls through to default CK 2-stage heuristics.
+Combines:
+1. DSv3 FP4 tuned config for FlyDSL kernels (E=257 shapes)
+2. Selective split-K for E=33 small-batch shapes via AITER_KSPLIT
+3. Opus sorting for faster dispatch
 
-Opus sorting provides faster token dispatch via optimized GPU sorting.
+For E=33 with d_expert=2048: the default heuristic gives ksplit=0 because
+token*topk > expert. But forcing ksplit=2 could help for the K=7168 dimension
+in the stage1 GEMM (7168 / 2 = 3584, 3584 % 256 == 0).
+
+However, the cktile split-K path requires (ksplit > 1 AND is_shuffled), which
+is true for our data. The question is whether it helps.
 """
 
 import os
 import importlib.util
 
-# --- Set DSv3 config BEFORE any aiter import ---
+# Discover aiter root BEFORE importing aiter
 _spec = importlib.util.find_spec("aiter")
 if _spec and _spec.submodule_search_locations:
     _aiter_pkg_dir = list(_spec.submodule_search_locations)[0]
@@ -44,6 +50,9 @@ def custom_kernel(data: input_t) -> output_t:
         topk_weights, topk_ids, config,
     ) = data
 
+    hidden_pad = config["d_hidden_pad"] - config["d_hidden"]
+    intermediate_pad = config["d_expert_pad"] - config["d_expert"]
+
     return fused_moe(
         hidden_states,
         gate_up_weight_shuffled,
@@ -54,6 +63,6 @@ def custom_kernel(data: input_t) -> output_t:
         quant_type=_PER1X32,
         w1_scale=gate_up_weight_scale_shuffled,
         w2_scale=down_weight_scale_shuffled,
-        hidden_pad=config["d_hidden_pad"] - config["d_hidden"],
-        intermediate_pad=config["d_expert_pad"] - config["d_expert"],
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
     )

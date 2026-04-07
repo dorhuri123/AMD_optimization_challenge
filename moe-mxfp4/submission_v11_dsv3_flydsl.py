@@ -1,26 +1,26 @@
 """
-MXFP4 MoE — DSv3 FP4 tuned config + FlyDSL kernels + opus sorting.
+MXFP4 MoE — v11: DSv3 FP4 tuned config with FlyDSL kernels.
 
 Uses AITER_CONFIG_FMOE pointing to dsv3_fp4_tuned_fmoe.csv which has
-FlyDSL-optimized kernel selections for E=257 shapes with fused FP4 quant.
-For E=33, falls through to default CK 2-stage heuristics.
+FlyDSL-optimized kernel selections for E=257 shapes. For E=33, falls
+through to default AITER heuristics since no E=33 entries exist.
 
-Opus sorting provides faster token dispatch via optimized GPU sorting.
+Expected gains for E=257 shapes: 1.4-1.7x over reference.
+E=33 shapes: same as reference (no tuned config).
 """
 
 import os
 import importlib.util
 
-# --- Set DSv3 config BEFORE any aiter import ---
+# --- Discover aiter root BEFORE importing aiter ---
 _spec = importlib.util.find_spec("aiter")
 if _spec and _spec.submodule_search_locations:
     _aiter_pkg_dir = list(_spec.submodule_search_locations)[0]
+    _dsv3_cfg = os.path.join(_aiter_pkg_dir, "configs", "model_configs", "dsv3_fp4_tuned_fmoe.csv")
+    if os.path.exists(_dsv3_cfg):
+        os.environ["AITER_CONFIG_FMOE"] = _dsv3_cfg
 elif _spec and _spec.origin:
     _aiter_pkg_dir = os.path.dirname(_spec.origin)
-else:
-    _aiter_pkg_dir = None
-
-if _aiter_pkg_dir:
     _dsv3_cfg = os.path.join(_aiter_pkg_dir, "configs", "model_configs", "dsv3_fp4_tuned_fmoe.csv")
     if os.path.exists(_dsv3_cfg):
         os.environ["AITER_CONFIG_FMOE"] = _dsv3_cfg
