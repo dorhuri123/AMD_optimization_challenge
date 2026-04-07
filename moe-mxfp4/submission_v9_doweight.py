@@ -1,30 +1,15 @@
 """
-MXFP4 MoE — DSv3 FP4 tuned config + FlyDSL kernels + opus sorting.
+MXFP4 MoE — v9: opus sorting + doweight_stage1=True.
 
-Uses AITER_CONFIG_FMOE pointing to dsv3_fp4_tuned_fmoe.csv which has
-FlyDSL-optimized kernel selections for E=257 shapes with fused FP4 quant.
-For E=33, falls through to default CK 2-stage heuristics.
+doweight_stage1=True moves routing weight multiplication from Stage 2 to Stage 1.
+This may reduce Stage 2 work since the weighted reduction is pre-applied.
 
-Opus sorting provides faster token dispatch via optimized GPU sorting.
+Note: BENCHMARKS.md says doweight_stage1=True caused "All tests FAIL" for
+the old submission, but that used block_size_M override. Without override,
+it may work differently.
 """
 
 import os
-import importlib.util
-
-# --- Set DSv3 config BEFORE any aiter import ---
-_spec = importlib.util.find_spec("aiter")
-if _spec and _spec.submodule_search_locations:
-    _aiter_pkg_dir = list(_spec.submodule_search_locations)[0]
-elif _spec and _spec.origin:
-    _aiter_pkg_dir = os.path.dirname(_spec.origin)
-else:
-    _aiter_pkg_dir = None
-
-if _aiter_pkg_dir:
-    _dsv3_cfg = os.path.join(_aiter_pkg_dir, "configs", "model_configs", "dsv3_fp4_tuned_fmoe.csv")
-    if os.path.exists(_dsv3_cfg):
-        os.environ["AITER_CONFIG_FMOE"] = _dsv3_cfg
-
 os.environ["AITER_USE_OPUS_MOE_SORTING"] = "1"
 
 import torch
@@ -52,6 +37,7 @@ def custom_kernel(data: input_t) -> output_t:
         topk_ids,
         activation=_SILU,
         quant_type=_PER1X32,
+        doweight_stage1=True,
         w1_scale=gate_up_weight_scale_shuffled,
         w2_scale=down_weight_scale_shuffled,
         hidden_pad=config["d_hidden_pad"] - config["d_hidden"],

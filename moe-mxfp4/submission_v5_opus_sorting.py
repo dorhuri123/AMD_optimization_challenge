@@ -1,31 +1,33 @@
 """
-MXFP4 MoE — DSv3 FP4 tuned config + FlyDSL kernels + opus sorting.
+MXFP4 MoE submission v5: DSv3 config + opus MoE sorting.
 
-Uses AITER_CONFIG_FMOE pointing to dsv3_fp4_tuned_fmoe.csv which has
-FlyDSL-optimized kernel selections for E=257 shapes with fused FP4 quant.
-For E=33, falls through to default CK 2-stage heuristics.
+AITER has two sorting implementations:
+- moe_sorting_fwd (default)
+- moe_sorting_opus_fwd (enabled by AITER_USE_OPUS_MOE_SORTING=1)
 
-Opus sorting provides faster token dispatch via optimized GPU sorting.
+The opus sorting may have better performance for our specific shapes.
+Combined with the DSv3 FP4 tuned config for optimal GEMM kernels.
 """
 
 import os
-import importlib.util
 
-# --- Set DSv3 config BEFORE any aiter import ---
-_spec = importlib.util.find_spec("aiter")
-if _spec and _spec.submodule_search_locations:
-    _aiter_pkg_dir = list(_spec.submodule_search_locations)[0]
-elif _spec and _spec.origin:
-    _aiter_pkg_dir = os.path.dirname(_spec.origin)
-else:
-    _aiter_pkg_dir = None
-
-if _aiter_pkg_dir:
-    _dsv3_cfg = os.path.join(_aiter_pkg_dir, "configs", "model_configs", "dsv3_fp4_tuned_fmoe.csv")
-    if os.path.exists(_dsv3_cfg):
-        os.environ["AITER_CONFIG_FMOE"] = _dsv3_cfg
-
+# Enable opus MoE sorting
 os.environ["AITER_USE_OPUS_MOE_SORTING"] = "1"
+
+# Set DSv3 config
+try:
+    import aiter as _aiter_pre
+    _aiter_root = os.path.dirname(os.path.dirname(_aiter_pre.__file__))
+    for _candidate in [
+        os.path.join(_aiter_root, "aiter", "configs", "model_configs", "dsv3_fp4_tuned_fmoe.csv"),
+        os.path.join(os.path.dirname(_aiter_pre.__file__), "configs", "model_configs", "dsv3_fp4_tuned_fmoe.csv"),
+        os.path.expanduser("~/aiter/aiter/configs/model_configs/dsv3_fp4_tuned_fmoe.csv"),
+    ]:
+        if os.path.exists(_candidate):
+            os.environ["AITER_CONFIG_FMOE"] = _candidate
+            break
+except Exception:
+    pass
 
 import torch
 from task import input_t, output_t
