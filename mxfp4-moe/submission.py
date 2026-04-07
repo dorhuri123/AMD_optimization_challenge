@@ -1,69 +1,59 @@
-import torch
-from typing import Dict, Optional
-from task import input_t, output_t
+"""
+MXFP4 MoE — DSv3 FP4 tuned config + FlyDSL kernels + opus sorting.
 
+Uses AITER_CONFIG_FMOE pointing to dsv3_fp4_tuned_fmoe.csv which has
+FlyDSL-optimized kernel selections for E=257 shapes with fused FP4 quant.
+For E=33, falls through to default CK 2-stage heuristics.
+
+Opus sorting provides faster token dispatch via optimized GPU sorting.
+"""
+
+import os
+import importlib.util
+
+# --- Set DSv3 config BEFORE any aiter import ---
+_spec = importlib.util.find_spec("aiter")
+if _spec and _spec.submodule_search_locations:
+    _aiter_pkg_dir = list(_spec.submodule_search_locations)[0]
+elif _spec and _spec.origin:
+    _aiter_pkg_dir = os.path.dirname(_spec.origin)
+else:
+    _aiter_pkg_dir = None
+
+if _aiter_pkg_dir:
+    _dsv3_cfg = os.path.join(_aiter_pkg_dir, "configs", "model_configs", "dsv3_fp4_tuned_fmoe.csv")
+    if os.path.exists(_dsv3_cfg):
+        os.environ["AITER_CONFIG_FMOE"] = _dsv3_cfg
+
+os.environ["AITER_USE_OPUS_MOE_SORTING"] = "1"
+
+import torch
+from task import input_t, output_t
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import fused_moe
 
-
-def _get_optimal_block_m(M: int, n_experts: int, top_k: int, d_expert: int) -> Optional[int]:
-    """Select block_size_M based on problem shape for better wave utilization."""
-    tokens_per_expert = (M * top_k) // n_experts
-    if tokens_per_expert <= 4:
-        return 32
-    elif tokens_per_expert <= 16:
-        return 32
-    elif tokens_per_expert <= 64:
-        return 64
-    else:
-        return 128
+_SILU = ActivationType.Silu
+_PER1X32 = QuantType.per_1x32
 
 
 def custom_kernel(data: input_t) -> output_t:
     (
-        hidden_states,
-        gate_up_weight,
-        down_weight,
-        gate_up_weight_scale,
-        down_weight_scale,
-        gate_up_weight_shuffled,
-        down_weight_shuffled,
-        gate_up_weight_scale_shuffled,
-        down_weight_scale_shuffled,
-        topk_weights,
-        topk_ids,
-        config,
+        hidden_states, _, _, _, _,
+        gate_up_weight_shuffled, down_weight_shuffled,
+        gate_up_weight_scale_shuffled, down_weight_scale_shuffled,
+        topk_weights, topk_ids, config,
     ) = data
 
-    hidden_pad = config["d_hidden_pad"] - config["d_hidden"]
-    intermediate_pad = config["d_expert_pad"] - config["d_expert"]
-    n_shared = config["n_shared_experts"]
-    n_routed = config["n_routed_experts"]
-    total_top_k = config["total_top_k"]
-    routed_top_k = config["n_experts_per_token"]
-    d_expert = config["d_expert"]
-    M = hidden_states.shape[0]
-    E_total = n_routed + n_shared
-
-    block_m = _get_optimal_block_m(M, E_total, total_top_k, d_expert)
-
-    output = fused_moe(
+    return fused_moe(
         hidden_states,
         gate_up_weight_shuffled,
         down_weight_shuffled,
         topk_weights,
         topk_ids,
-        expert_mask=None,
-        activation=ActivationType.Silu,
-        quant_type=QuantType.per_1x32,
-        doweight_stage1=False,
+        activation=_SILU,
+        quant_type=_PER1X32,
         w1_scale=gate_up_weight_scale_shuffled,
         w2_scale=down_weight_scale_shuffled,
-        a1_scale=None,
-        a2_scale=None,
-        block_size_M=block_m,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
+        hidden_pad=config["d_hidden_pad"] - config["d_hidden"],
+        intermediate_pad=config["d_expert_pad"] - config["d_expert"],
     )
-
-    return output
